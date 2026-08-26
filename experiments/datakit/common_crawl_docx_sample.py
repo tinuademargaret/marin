@@ -7,7 +7,7 @@ import argparse
 import json
 import logging
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping
 from functools import partial
 from statistics import median
 
@@ -22,7 +22,10 @@ from marin.datakit.download.common_crawl_docx import (
     DocxRecordSelector,
     DocxSelectionReason,
     LinguaLanguageDetector,
+    evenly_spaced_sample,
     extract_common_crawl_docx,
+    fetch_common_crawl_docx,
+    identify_common_crawl_docx_language,
 )
 from marin.datakit.download.common_crawl_plan import (
     DISCOVERY_SCHEMA,
@@ -59,18 +62,6 @@ class CommonCrawlDocxSampleReport(BaseModel):
     candidates: int
     extracted: int
     normalized: int
-
-
-def stratified_partition_slice(partitions: Sequence[str], count: int) -> tuple[str, ...]:
-    """Select evenly spaced partitions, including both ends of the manifest."""
-    if count <= 0:
-        raise ValueError("count must be positive")
-    if count >= len(partitions):
-        return tuple(partitions)
-    if count == 1:
-        return (partitions[len(partitions) // 2],)
-    indices = [round(index * (len(partitions) - 1) / (count - 1)) for index in range(count)]
-    return tuple(partitions[index] for index in indices)
 
 
 def sample_partition_records(
@@ -114,7 +105,7 @@ def discover_sample_candidates(
         crawl_id=source.crawl_id,
         subset=source.subset,
     )
-    selected_partitions = stratified_partition_slice(all_partitions, index_partitions)
+    selected_partitions = evenly_spaced_sample(all_partitions, index_partitions)
     pipeline = (
         Dataset.from_list(list(selected_partitions))
         .flat_map(
@@ -174,7 +165,7 @@ def sample_report_markdown(
     candidate_rows: list[dict[str, object]],
     extracted_rows: list[dict[str, object]],
     normalized_rows: list[dict[str, object]],
-    extraction_counters: Mapping[str, int | float],
+    stage_counters: Mapping[str, int | float],
     examples_per_reason: int,
 ) -> tuple[str, list[dict[str, object]]]:
     candidate_counts = Counter(_candidate_selection_reason(row) for row in candidate_rows)
@@ -197,22 +188,23 @@ def sample_report_markdown(
     word_counts = [int(row["word_count"]) for row in extracted_rows]
     table_documents = sum(int(row["table_count"]) > 0 for row in extracted_rows)
     language_counts = Counter(str(row["language"]) for row in extracted_rows)
-    failure_counters = {
-        key.removeprefix("common_crawl_docx/"): value
-        for key, value in sorted(extraction_counters.items())
-        if key.startswith("common_crawl_docx/")
-        and key
-        not in {
-            "common_crawl_docx/fetched",
-            "common_crawl_docx/valid_files",
-            "common_crawl_docx/text_bytes",
-            "common_crawl_docx/words",
-            "common_crawl_docx/tables",
-            "common_crawl_docx/images",
-            "common_crawl_docx/documents_with_tables",
-        }
-        and value
+    routine_counters = {
+        "fetched",
+        "fetched_payload_bytes",
+        "valid_files",
+        "text_bytes",
+        "words",
+        "tables",
+        "images",
+        "documents_with_tables",
     }
+    review_counters: dict[str, int | float] = {}
+    for key, value in sorted(stage_counters.items()):
+        if "common_crawl_docx/" not in key or not value:
+            continue
+        counter_name = key.rsplit("common_crawl_docx/", maxsplit=1)[1]
+        if counter_name not in routine_counters:
+            review_counters[key] = value
 
     lines = [
         f"# Common Crawl DOCX sample: {source.crawl_id}",
@@ -249,12 +241,12 @@ def sample_report_markdown(
             "- Languages: "
             + (", ".join(f"{language}={count}" for language, count in language_counts.most_common(10)) or "none"),
             "",
-            "## Counted extraction failures",
+            "## Stage counters requiring review",
             "",
         ]
     )
-    if failure_counters:
-        lines.extend(f"- `{name}`: {value:,}" for name, value in failure_counters.items())
+    if review_counters:
+        lines.extend(f"- `{name}`: {value:,}" for name, value in review_counters.items())
     else:
         lines.append("- None")
 
@@ -278,23 +270,27 @@ def write_sample_report(
     *,
     source: CommonCrawlSource,
     discovery_path: str,
-    extraction_path: str,
+    language_path: str,
+    stage_counter_paths: tuple[tuple[str, str], ...],
     normalized_path: str,
     examples_per_reason: int,
 ) -> CommonCrawlDocxSampleReport:
     """Render the sample funnel and bounded review examples as Markdown and JSONL."""
     discovery = read_artifact(discovery_path, CommonCrawlDiscoverySummary)
     candidate_rows = _parquet_rows(discovery.manifest_path)
-    extracted_rows = _parquet_rows(prefix_join(extraction_path, "data"))
+    extracted_rows = _parquet_rows(prefix_join(language_path, "data"))
     normalized = read_artifact(normalized_path, NormalizedData)
     normalized_rows = _parquet_rows(normalized.main_output_dir)
-    extraction = read_artifact(extraction_path, CommonCrawlDocxStageResult)
+    stage_counters: dict[str, int | float] = {}
+    for stage_name, stage_path in stage_counter_paths:
+        result = read_artifact(stage_path, CommonCrawlDocxStageResult)
+        stage_counters.update({f"{stage_name}/{key}": value for key, value in result.counters.items()})
     markdown, examples = sample_report_markdown(
         source=source,
         candidate_rows=candidate_rows,
         extracted_rows=extracted_rows,
         normalized_rows=normalized_rows,
-        extraction_counters=extraction.counters,
+        stage_counters=stage_counters,
         examples_per_reason=examples_per_reason,
     )
     markdown_path = prefix_join(output_path, "report.md")
@@ -319,8 +315,8 @@ def common_crawl_docx_sample_steps(
     index_partitions: int = DEFAULT_INDEX_PARTITIONS,
     candidates_per_reason: int = DEFAULT_CANDIDATES_PER_REASON_PER_PARTITION,
     examples_per_reason: int = DEFAULT_EXAMPLES_PER_REASON,
-) -> tuple[StepSpec, StepSpec, StepSpec, StepSpec, StepSpec]:
-    """Build the sample discovery, extraction, normalization, and report DAG."""
+) -> tuple[StepSpec, StepSpec, StepSpec, StepSpec, StepSpec, StepSpec, StepSpec]:
+    """Build the sample discovery, fetch, extraction, LID, normalization, and report DAG."""
     if candidates_per_reason <= 0 or examples_per_reason <= 0:
         raise ValueError("candidate and example limits must be positive")
     if len(config.sources) != 1:
@@ -357,16 +353,10 @@ def common_crawl_docx_sample_steps(
     )
     extractor = DoclingDocxExtractor()
     detector = LinguaLanguageDetector()
-    extraction = StepSpec(
-        name=f"samples/common-crawl-docx/{slug}/extracted",
+    fetch = StepSpec(
+        name=f"samples/common-crawl-docx/{slug}/fetched",
         fn=remote(
-            partial(
-                extract_common_crawl_docx,
-                plan_output_path=plan.output_path,
-                config=config,
-                extractor=extractor,
-                language_detector=detector,
-            ),
+            partial(fetch_common_crawl_docx, plan_output_path=plan.output_path, config=config),
             resources=ResourceConfig(cpu=1, ram="4g"),
             pip_dependency_groups=["datakit"],
         ),
@@ -374,16 +364,57 @@ def common_crawl_docx_sample_steps(
         hash_attrs={
             "maximum_warc_record_bytes": config.maximum_warc_record_bytes,
             "maximum_payload_bytes": config.maximum_payload_bytes,
+            "schema_version": 1,
+        },
+    )
+    extraction = StepSpec(
+        name=f"samples/common-crawl-docx/{slug}/extracted",
+        fn=remote(
+            partial(
+                extract_common_crawl_docx,
+                fetched_input_path=fetch.output_path,
+                config=config,
+                extractor=extractor,
+            ),
+            resources=ResourceConfig(cpu=1, ram="4g"),
+            pip_dependency_groups=["datakit"],
+        ),
+        deps=[fetch],
+        hash_attrs={
             "maximum_zip_entries": config.maximum_zip_entries,
             "maximum_uncompressed_bytes": config.maximum_uncompressed_bytes,
             "extractor": extractor.version,
+            "schema_version": 5,
+        },
+    )
+    language = StepSpec(
+        name=f"samples/common-crawl-docx/{slug}/language",
+        fn=remote(
+            partial(
+                identify_common_crawl_docx_language,
+                extracted_input_path=extraction.output_path,
+                config=config,
+                detector=detector,
+            ),
+            resources=ResourceConfig(cpu=1, ram="4g"),
+            pip_dependency_groups=["datakit"],
+        ),
+        deps=[extraction],
+        hash_attrs={
             "language_detector": detector.version,
-            "schema_version": 2,
+            "chunk_chars": config.language_chunk_chars,
+            "sample_chunks": config.language_sample_chunks,
+            "minimum_alpha_bytes": config.language_minimum_alpha_bytes,
+            "minimum_alpha_ratio": config.language_minimum_alpha_ratio,
+            "maximum_table_alpha_bytes": config.language_maximum_table_alpha_bytes,
+            "distribution_top_k": config.language_distribution_top_k,
+            "minimum_score": config.language_minimum_score,
+            "schema_version": 3,
         },
     )
     normalized = normalize_step(
         name=f"samples/common-crawl-docx/{slug}/normalized",
-        download=extraction,
+        download=language,
         relative_input_path="data",
         file_extensions=(".parquet",),
         id_field="source_id",
@@ -396,14 +427,19 @@ def common_crawl_docx_sample_steps(
             write_sample_report,
             source=source,
             discovery_path=discovery.output_path,
-            extraction_path=extraction.output_path,
+            language_path=language.output_path,
+            stage_counter_paths=(
+                ("fetch", fetch.output_path),
+                ("extraction", extraction.output_path),
+                ("language", language.output_path),
+            ),
             normalized_path=normalized.output_path,
             examples_per_reason=examples_per_reason,
         ),
-        deps=[discovery, extraction, normalized],
-        hash_attrs={"examples_per_reason": examples_per_reason, "report_version": 1},
+        deps=[discovery, fetch, extraction, language, normalized],
+        hash_attrs={"examples_per_reason": examples_per_reason, "report_version": 2},
     )
-    return discovery, plan, extraction, normalized, report
+    return discovery, plan, fetch, extraction, language, normalized, report
 
 
 def main() -> None:
