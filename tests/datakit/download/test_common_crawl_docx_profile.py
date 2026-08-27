@@ -9,6 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from docx import Document
+from marin.datakit.download.common_crawl_docx import FETCHED_COMMON_CRAWL_DOCX_SCHEMA
 from marin.execution.step_spec import StepSpec
 from zephyr.dataset import ShardInfo
 
@@ -22,6 +23,7 @@ from experiments.datakit.common_crawl_docx_profile import (
     common_crawl_docx_profile_steps,
     derive_run_metrics,
     main,
+    prepare_extraction_profile_corpus,
     profile_extraction_shard,
     profile_summary,
 )
@@ -33,6 +35,51 @@ def _docx_payload(text: str) -> bytes:
     document.add_paragraph(text)
     document.save(stream)
     return stream.getvalue()
+
+
+def _fetched_record(index: int) -> dict[str, object]:
+    return {
+        "payload": f"payload-{index}".encode(),
+        "source_id": f"document-{index}",
+        "source": "common_crawl",
+        "crawl_id": "CC-MAIN-2026-34",
+        "url": f"https://example.com/{index}.docx",
+        "warc_filename": "crawl.warc.gz",
+        "warc_record_offset": index,
+        "warc_record_length": 100,
+        "warc_date": None,
+        "http_status": 200,
+        "http_content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "identified_payload_type": None,
+        "content_digest": f"sha1:{index}",
+        "index_status": 200,
+        "index_content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "index_detected_type": None,
+        "selection_reason": "declared_mime",
+    }
+
+
+def test_prepare_extraction_profile_corpus_materializes_nonempty_physical_shards(tmp_path: Path) -> None:
+    fetched_data = tmp_path / "fetched" / "data"
+    fetched_data.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist([_fetched_record(index) for index in range(40)], schema=FETCHED_COMMON_CRAWL_DOCX_SCHEMA),
+        fetched_data / "part-00000.parquet",
+    )
+
+    corpus = prepare_extraction_profile_corpus(
+        str(tmp_path / "prepared"),
+        fetched_input_path=str(tmp_path / "fetched"),
+        target_shards=4,
+        max_workers=4,
+    )
+
+    files = sorted((tmp_path / "prepared" / "data").glob("*.parquet"))
+    row_counts = [pq.read_metadata(path).num_rows for path in files]
+    assert len(files) == 4
+    assert sum(row_counts) == 40
+    assert all(count > 0 for count in row_counts)
+    assert corpus.documents == 40
 
 
 def test_profile_extraction_shard_separates_initialization_read_and_conversion(tmp_path: Path) -> None:
@@ -195,16 +242,19 @@ def test_profile_steps_resolve_json_serializable_output_paths(tmp_path: Path, mo
         ),
     )
 
-    runs, report = common_crawl_docx_profile_steps(
+    preparation, runs, report = common_crawl_docx_profile_steps(
         DocxExtractionProfileConfig(
             name="smoke",
             variants=variants,
+            preparation_shards=4,
             maximum_zip_entries=10_000,
             maximum_uncompressed_bytes=1 << 20,
         ),
         fetched=fetched,
     )
 
+    assert preparation.deps == [fetched]
     assert len(runs) == 1
+    assert runs[0].deps == [preparation]
     assert runs[0].output_path.startswith(str(tmp_path))
     assert report.output_path.startswith(str(tmp_path))

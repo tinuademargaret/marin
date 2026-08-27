@@ -523,10 +523,11 @@ def main() -> None:
             ),
             *persistence_variants(),
         )
-        _, profile_report = common_crawl_docx_profile_steps(
+        _, _, profile_report = common_crawl_docx_profile_steps(
             DocxExtractionProfileConfig(
                 name=f"{args.crawl_id}-sample",
                 variants=profile_variants,
+                preparation_shards=args.profile_target_shards,
                 maximum_zip_entries=config.maximum_zip_entries,
                 maximum_uncompressed_bytes=config.maximum_uncompressed_bytes,
             ),

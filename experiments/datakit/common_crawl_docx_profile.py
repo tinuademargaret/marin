@@ -25,6 +25,7 @@ from fray.types import ResourceConfig
 from marin.datakit.download.common_crawl_docx import (
     DEFAULT_MAXIMUM_UNCOMPRESSED_BYTES,
     DEFAULT_MAXIMUM_ZIP_ENTRIES,
+    FETCHED_COMMON_CRAWL_DOCX_SCHEMA,
     DoclingDocxExtractor,
     DocxExtractionError,
     EmptyDocxTextError,
@@ -37,12 +38,14 @@ from marin.execution.remote import remote
 from marin.execution.step_spec import StepSpec
 from pydantic import BaseModel
 from rigging.filesystem import prefix_join, url_to_fs
+from zephyr import counters
 from zephyr.dataset import Dataset, ShardInfo
 from zephyr.execution import ZephyrContext
 from zephyr.runners import SubprocessRunner
 
 PROFILE_SCHEMA_VERSION = 1
 DEFAULT_WORKER_COUNTS = (1, 2, 4, 8, 16)
+DEFAULT_PREPARATION_SHARDS = 128
 _MEBIBYTE = 1 << 20
 
 
@@ -96,12 +99,15 @@ class DocxExtractionProfileConfig:
 
     name: str
     variants: tuple[DocxExtractionProfileVariant, ...]
+    preparation_shards: int
     maximum_zip_entries: int
     maximum_uncompressed_bytes: int
 
     def __post_init__(self) -> None:
         if not self.name or not self.variants:
             raise ValueError("name and variants must not be empty")
+        if self.preparation_shards <= 0:
+            raise ValueError("preparation_shards must be positive")
         if len({variant.name for variant in self.variants}) != len(self.variants):
             raise ValueError("variant names must be unique")
 
@@ -114,6 +120,15 @@ class DocxExtractionProfileRun(BaseModel):
     worker_count: int
     target_shards: int
     lifecycle: str
+    counters: dict[str, int | float]
+
+
+class DocxExtractionProfileCorpus(BaseModel):
+    """Fixed physical payload shards reused by every profiling treatment."""
+
+    data_dir: str
+    target_shards: int
+    documents: int
     counters: dict[str, int | float]
 
 
@@ -222,6 +237,58 @@ def calibrated_shard_targets(
         f"{minutes}m": min(input_shards, max(1, math.ceil(total_shard_seconds / (minutes * 60))))
         for minutes in target_minutes
     }
+
+
+def _profile_partition_key(record: Mapping[str, object]) -> str:
+    source_id = record["source_id"]
+    if not isinstance(source_id, str):
+        raise TypeError("Fetched DOCX source_id must be a string")
+    return source_id
+
+
+def _prepared_profile_records(_source_id: str, records: Iterator[dict[str, object]]) -> Iterator[dict[str, object]]:
+    for record in records:
+        counters.pipeline.update_counter("common_crawl_docx_profile/prepared_documents", 1)
+        yield record
+
+
+def prepare_extraction_profile_corpus(
+    output_path: str,
+    *,
+    fetched_input_path: str,
+    target_shards: int,
+    max_workers: int,
+) -> DocxExtractionProfileCorpus:
+    """Materialize fetched records into deterministic physical profiling shards."""
+    if target_shards <= 0 or max_workers <= 0:
+        raise ValueError("target_shards and max_workers must be positive")
+    pipeline = (
+        Dataset.from_files(prefix_join(fetched_input_path, "data/**/*.parquet"))
+        .load_parquet()
+        .group_by(
+            key=_profile_partition_key,
+            reducer=_prepared_profile_records,
+            num_output_shards=target_shards,
+        )
+        .write_parquet(
+            prefix_join(output_path, "data/part-{shard:05d}-of-{total:05d}.parquet"),
+            schema=FETCHED_COMMON_CRAWL_DOCX_SCHEMA,
+            skip_existing=True,
+        )
+    )
+    outcome = ZephyrContext(
+        name="common-crawl-docx-profile-preparation",
+        resources=ResourceConfig(cpu=1, ram="8g"),
+        max_workers=min(max_workers, target_shards),
+        chunk_storage_prefix=prefix_join(output_path, "_zephyr"),
+    ).execute(pipeline)
+    documents = int(outcome.counters.get("common_crawl_docx_profile/prepared_documents", 0))
+    return DocxExtractionProfileCorpus(
+        data_dir=prefix_join(output_path, "data"),
+        target_shards=target_shards,
+        documents=documents,
+        counters=dict(outcome.counters),
+    )
 
 
 def profile_extraction_shard(
@@ -369,14 +436,14 @@ def _profile_row(
 def run_extraction_profile(
     output_path: str,
     *,
-    fetched_input_path: str,
+    prepared_input_path: str,
     variant: DocxExtractionProfileVariant,
     maximum_zip_entries: int,
     maximum_uncompressed_bytes: int,
 ) -> DocxExtractionProfileRun:
     """Run one extraction profiling treatment over the fixed fetched corpus."""
     pipeline = (
-        Dataset.from_files(prefix_join(fetched_input_path, "data/**/*.parquet"))
+        Dataset.from_files(prefix_join(prepared_input_path, "data/**/*.parquet"))
         .reshard(variant.target_shards)
         .map_shard(
             partial(
@@ -418,6 +485,7 @@ class RunMetrics:
     observed_workers: int
     peak_concurrency: int
     target_shards: int
+    observed_shards: int
     lifecycle: str
     documents: int
     failures: int
@@ -478,6 +546,7 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
         observed_workers=len(worker_ids),
         peak_concurrency=peak_concurrency,
         target_shards=int(shards[0]["target_shards"]),
+        observed_shards=len(shards),
         lifecycle=str(shards[0]["lifecycle"]),
         documents=len(documents),
         failures=sum(not bool(row["success"]) for row in documents),
@@ -562,6 +631,19 @@ def _divide(numerator: float | int, denominator: float | int) -> float:
 def profile_decisions(metrics: RunMetrics) -> list[tuple[str, str, str]]:
     """Map measurements to concise threshold-based recommendations."""
     shard_ratio = _divide(metrics.shard_percentiles["p99"], metrics.shard_percentiles["p50"])
+    shard_decision: tuple[str, str] = (
+        ("insufficient", f"Only {metrics.observed_shards} non-empty shard was measured.")
+        if metrics.observed_shards < 2
+        else (
+            "good" if shard_ratio < 2 else "watch" if shard_ratio < 3 else "action",
+            f"p99/p50 is {shard_ratio:.2f}x.",
+        )
+    )
+    idle_decision: tuple[str, str] = (
+        ("insufficient", "Peak concurrency was one; terminal idle cannot measure worker imbalance.")
+        if metrics.peak_concurrency < 2
+        else (_idle_rating(metrics.terminal_idle_fraction), _idle_action(metrics))
+    )
     return [
         (
             "Converter initialization",
@@ -569,12 +651,8 @@ def profile_decisions(metrics: RunMetrics) -> list[tuple[str, str, str]]:
             _initialization_action(metrics),
         ),
         ("Document tail", _tail_rating(metrics.top_one_percent_work_share), _tail_action(metrics)),
-        (
-            "Shard balance",
-            "good" if shard_ratio < 2 else "watch" if shard_ratio < 3 else "action",
-            f"p99/p50 is {shard_ratio:.2f}x.",
-        ),
-        ("Terminal idle", _idle_rating(metrics.terminal_idle_fraction), _idle_action(metrics)),
+        ("Shard balance", shard_decision[0], shard_decision[1]),
+        ("Terminal idle", idle_decision[0], idle_decision[1]),
         ("I/O versus conversion", "context", _service_action(metrics)),
     ]
 
@@ -734,14 +812,14 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
         "",
         "## Run overview",
         "",
-        "| Run | Requested workers | Observed workers | Peak concurrency | Shards | Documents | "
+        "| Run | Requested workers | Observed workers | Peak concurrency | Prepared/observed shards | Documents | "
         "Wall time | Docs/s | Init | Read | Conversion | Utilization | Terminal idle |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for metric in metrics:
         lines.append(
             f"| `{metric.variant}` | {metric.worker_count} | {metric.observed_workers} | {metric.peak_concurrency} | "
-            f"{metric.target_shards} | {metric.documents:,} | "
+            f"{metric.target_shards}/{metric.observed_shards} | {metric.documents:,} | "
             f"{_duration(metric.stage_wall_seconds)} | {_divide(metric.documents, metric.stage_wall_seconds):.2f} | "
             f"{metric.initialization_fraction:.1%} | {metric.read_fraction:.1%} | {metric.conversion_fraction:.1%} | "
             f"{metric.worker_utilization:.1%} | {metric.terminal_idle_fraction:.1%} |"
@@ -839,7 +917,7 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
             "",
             "- Read time includes Parquet access and decoding. Conversion time includes DOCX validation and "
             "Docling conversion.",
-            "- Worker utilization and terminal idle use observed Iris worker identities and shard intervals, "
+            "- Worker utilization and terminal idle use observed Zephyr worker-process identities and shard intervals, "
             "not requested capacity.",
             "- Cross-worker stage wall time uses wall clocks and can contain small clock-skew error.",
             "- Peak CPU is sampled at document boundaries; use Zephyr finelog CPU time as the primary A/B cost signal.",
@@ -1052,16 +1130,31 @@ def _recommended_shard_size(metrics: Sequence[RunMetrics]) -> RunMetrics | None:
 
 def common_crawl_docx_profile_steps(
     config: DocxExtractionProfileConfig, *, fetched: StepSpec
-) -> tuple[tuple[StepSpec, ...], StepSpec]:
+) -> tuple[StepSpec, tuple[StepSpec, ...], StepSpec]:
     """Build independent profile runs followed by one report step."""
     slug = config.name.lower()
+    preparation = StepSpec(
+        name=f"profiling/common-crawl-docx/{slug}/prepared",
+        fn=remote(
+            partial(
+                prepare_extraction_profile_corpus,
+                fetched_input_path=fetched.output_path,
+                target_shards=config.preparation_shards,
+                max_workers=max(variant.worker_count for variant in config.variants),
+            ),
+            resources=ResourceConfig(cpu=1, ram="8g"),
+            pip_dependency_groups=["datakit"],
+        ),
+        deps=[fetched],
+        hash_attrs={"target_shards": config.preparation_shards, "schema_version": 1},
+    )
     runs = tuple(
         StepSpec(
             name=f"profiling/common-crawl-docx/{slug}/{variant.name}",
             fn=remote(
                 partial(
                     run_extraction_profile,
-                    fetched_input_path=fetched.output_path,
+                    prepared_input_path=preparation.output_path,
                     variant=variant,
                     maximum_zip_entries=config.maximum_zip_entries,
                     maximum_uncompressed_bytes=config.maximum_uncompressed_bytes,
@@ -1069,7 +1162,7 @@ def common_crawl_docx_profile_steps(
                 resources=ResourceConfig(cpu=1, ram="4g"),
                 pip_dependency_groups=["datakit"],
             ),
-            deps=[fetched],
+            deps=[preparation],
             hash_attrs={
                 "variant": variant.hash_attrs,
                 "maximum_zip_entries": config.maximum_zip_entries,
@@ -1085,7 +1178,7 @@ def common_crawl_docx_profile_steps(
         deps=list(runs),
         hash_attrs={"report_version": 1},
     )
-    return runs, report
+    return preparation, runs, report
 
 
 def _comma_separated_ints(value: str) -> tuple[int, ...]:
@@ -1129,15 +1222,16 @@ def main() -> None:
     input_shards = len(fs.glob(resolved))
     if input_shards == 0:
         raise FileNotFoundError(f"No fetched Parquet shards match {input_glob}")
-    target_shards = args.target_shards or input_shards
+    target_shards = args.target_shards or DEFAULT_PREPARATION_SHARDS
     variants = list(scaling_variants(target_shards=target_shards, worker_counts=args.worker_counts))
-    if not args.skip_persistence and input_shards > 1:
+    if not args.skip_persistence and target_shards > 1:
         variants.extend(persistence_variants())
     if args.shard_size_targets:
         variants.extend(shard_size_variants(args.shard_size_targets, worker_count=args.shard_size_workers))
     config = DocxExtractionProfileConfig(
         name=args.name,
         variants=tuple(variants),
+        preparation_shards=target_shards,
         maximum_zip_entries=args.maximum_zip_entries,
         maximum_uncompressed_bytes=args.maximum_uncompressed_bytes,
     )
@@ -1145,13 +1239,21 @@ def main() -> None:
         print(json.dumps([variant.__dict__ for variant in config.variants], default=str, indent=2))
         return
 
+    prepared_path = prefix_join(args.output_path, "prepared")
+    prepared = prepare_extraction_profile_corpus(
+        prepared_path,
+        fetched_input_path=args.fetched_input_path,
+        target_shards=config.preparation_shards,
+        max_workers=max(variant.worker_count for variant in config.variants),
+    )
+    write_artifact(prepared, prepared_path)
     run_paths: list[str] = []
     results: list[DocxExtractionProfileRun] = []
     for variant in config.variants:
         run_path = prefix_join(prefix_join(args.output_path, "runs"), variant.name)
         result = run_extraction_profile(
             run_path,
-            fetched_input_path=args.fetched_input_path,
+            prepared_input_path=prepared_path,
             variant=variant,
             maximum_zip_entries=config.maximum_zip_entries,
             maximum_uncompressed_bytes=config.maximum_uncompressed_bytes,
@@ -1167,14 +1269,14 @@ def main() -> None:
         calibration_metrics = derive_run_metrics(_parquet_rows(calibration.metrics_dir))
         targets = calibrated_shard_targets(
             total_shard_seconds=calibration_metrics.shard_wall_seconds_total,
-            input_shards=input_shards,
+            input_shards=config.preparation_shards,
             target_minutes=args.shard_minutes,
         )
         for variant in shard_size_variants(targets, worker_count=args.shard_size_workers):
             run_path = prefix_join(prefix_join(args.output_path, "runs"), variant.name)
             result = run_extraction_profile(
                 run_path,
-                fetched_input_path=args.fetched_input_path,
+                prepared_input_path=prepared_path,
                 variant=variant,
                 maximum_zip_entries=config.maximum_zip_entries,
                 maximum_uncompressed_bytes=config.maximum_uncompressed_bytes,
