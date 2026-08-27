@@ -49,9 +49,19 @@ from zephyr import counters
 from zephyr.dataset import Dataset
 from zephyr.execution import ZephyrContext
 
+from experiments.datakit.common_crawl_docx_profile import (
+    DocxExtractionProfileConfig,
+    common_crawl_docx_profile_steps,
+    persistence_variants,
+    scaling_variants,
+)
+
 DEFAULT_INDEX_PARTITIONS = 6
-DEFAULT_CANDIDATES_PER_REASON_PER_PARTITION = 10
+DEFAULT_MAXIMUM_DOCUMENTS = 10_000
+DEFAULT_CANDIDATES_PER_REASON_PER_PARTITION = DEFAULT_MAXIMUM_DOCUMENTS
 DEFAULT_EXAMPLES_PER_REASON = 3
+DEFAULT_PROFILE_WORKER_COUNTS = (1, 2, 4, 8, 16)
+DEFAULT_PROFILE_TARGET_SHARDS = 128
 
 
 class CommonCrawlDocxSampleReport(BaseModel):
@@ -65,14 +75,16 @@ class CommonCrawlDocxSampleReport(BaseModel):
 
 
 def sample_partition_records(
-    index_partition: str,
+    partition_and_limit: tuple[str, int],
     *,
     source: CommonCrawlSource,
     batch_rows: int,
     candidates_per_reason: int,
 ) -> Iterator[dict[str, object]]:
     """Take the first deterministic candidates from each primary selection stratum."""
+    index_partition, maximum_candidates = partition_and_limit
     selected: Counter[DocxSelectionReason] = Counter()
+    total_selected = 0
     for candidate in discover_index_partition(
         index_partition,
         source=source,
@@ -83,8 +95,11 @@ def sample_partition_records(
         if selected[reason] >= candidates_per_reason:
             continue
         selected[reason] += 1
+        total_selected += 1
         counters.pipeline.update_counter("common_crawl/selected_records", 1)
         yield selected_common_crawl_record(candidate)
+        if total_selected >= maximum_candidates:
+            return
         if all(selected[reason] >= candidates_per_reason for reason in DocxSelectionReason):
             return
 
@@ -95,6 +110,7 @@ def discover_sample_candidates(
     *,
     index_partitions: int,
     candidates_per_reason: int,
+    maximum_documents: int,
 ) -> CommonCrawlDiscoverySummary:
     """Scan an evenly spaced partition slice and materialize a bounded candidate manifest."""
     if len(config.sources) != 1:
@@ -106,8 +122,9 @@ def discover_sample_candidates(
         subset=source.subset,
     )
     selected_partitions = evenly_spaced_sample(all_partitions, index_partitions)
+    partition_limits = _partition_limits(selected_partitions, maximum_documents)
     pipeline = (
-        Dataset.from_list(list(selected_partitions))
+        Dataset.from_list(partition_limits)
         .flat_map(
             partial(
                 sample_partition_records,
@@ -125,13 +142,27 @@ def discover_sample_candidates(
     outcome = ZephyrContext(
         name=f"common-crawl-docx-sample-discovery-{source.crawl_id.lower()}",
         resources=ResourceConfig(cpu=1, ram="8g"),
-        max_workers=min(config.max_workers, len(selected_partitions)),
+        max_workers=min(config.max_workers, len(partition_limits)),
     ).execute(pipeline)
     return CommonCrawlDiscoverySummary(
         manifest_path=prefix_join(output_path, "records"),
         num_sources=1,
         num_records=int(outcome.counters.get("common_crawl/selected_records", 0)),
     )
+
+
+def _partition_limits(partitions: tuple[str, ...] | list[str], maximum_documents: int) -> list[tuple[str, int]]:
+    """Allocate a strict global document ceiling across deterministic partitions."""
+    if maximum_documents <= 0:
+        raise ValueError("maximum_documents must be positive")
+    if not partitions:
+        raise ValueError("partitions must not be empty")
+    quotient, remainder = divmod(maximum_documents, len(partitions))
+    return [
+        (partition, quotient + (index < remainder))
+        for index, partition in enumerate(partitions)
+        if quotient + (index < remainder) > 0
+    ]
 
 
 def _parquet_rows(path: str) -> list[dict[str, object]]:
@@ -314,10 +345,11 @@ def common_crawl_docx_sample_steps(
     *,
     index_partitions: int = DEFAULT_INDEX_PARTITIONS,
     candidates_per_reason: int = DEFAULT_CANDIDATES_PER_REASON_PER_PARTITION,
+    maximum_documents: int = DEFAULT_MAXIMUM_DOCUMENTS,
     examples_per_reason: int = DEFAULT_EXAMPLES_PER_REASON,
 ) -> tuple[StepSpec, StepSpec, StepSpec, StepSpec, StepSpec, StepSpec, StepSpec]:
     """Build the sample discovery, fetch, extraction, LID, normalization, and report DAG."""
-    if candidates_per_reason <= 0 or examples_per_reason <= 0:
+    if candidates_per_reason <= 0 or maximum_documents <= 0 or examples_per_reason <= 0:
         raise ValueError("candidate and example limits must be positive")
     if len(config.sources) != 1:
         raise ValueError("The bounded sample pipeline requires exactly one Common Crawl source")
@@ -331,6 +363,7 @@ def common_crawl_docx_sample_steps(
                 config=config,
                 index_partitions=index_partitions,
                 candidates_per_reason=candidates_per_reason,
+                maximum_documents=maximum_documents,
             ),
             resources=ResourceConfig(cpu=1, ram="4g"),
             pip_dependency_groups=["datakit"],
@@ -343,6 +376,7 @@ def common_crawl_docx_sample_steps(
             "subset": source.subset,
             "index_partitions": index_partitions,
             "candidates_per_reason": candidates_per_reason,
+            "maximum_documents": maximum_documents,
             "schema_version": 2,
         },
     )
@@ -452,8 +486,12 @@ def main() -> None:
         type=int,
         default=DEFAULT_CANDIDATES_PER_REASON_PER_PARTITION,
     )
+    parser.add_argument("--maximum-documents", type=int, default=DEFAULT_MAXIMUM_DOCUMENTS)
     parser.add_argument("--examples-per-reason", type=int, default=DEFAULT_EXAMPLES_PER_REASON)
     parser.add_argument("--max-workers", type=int, default=24)
+    parser.add_argument("--profile-worker-counts", type=int, nargs="+", default=DEFAULT_PROFILE_WORKER_COUNTS)
+    parser.add_argument("--profile-target-shards", type=int, default=DEFAULT_PROFILE_TARGET_SHARDS)
+    parser.add_argument("--skip-profile", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -473,9 +511,29 @@ def main() -> None:
         config,
         index_partitions=args.index_partitions,
         candidates_per_reason=args.candidates_per_reason_per_partition,
+        maximum_documents=args.maximum_documents,
         examples_per_reason=args.examples_per_reason,
     )
-    StepRunner().run([steps[-1]], dry_run=args.dry_run, max_concurrent=1)
+    terminals = [steps[-1]]
+    if not args.skip_profile:
+        profile_variants = (
+            *scaling_variants(
+                target_shards=args.profile_target_shards,
+                worker_counts=tuple(args.profile_worker_counts),
+            ),
+            *persistence_variants(),
+        )
+        _, profile_report = common_crawl_docx_profile_steps(
+            DocxExtractionProfileConfig(
+                name=f"{args.crawl_id}-sample",
+                variants=profile_variants,
+                maximum_zip_entries=config.maximum_zip_entries,
+                maximum_uncompressed_bytes=config.maximum_uncompressed_bytes,
+            ),
+            fetched=steps[2],
+        )
+        terminals.append(profile_report)
+    StepRunner().run(terminals, dry_run=args.dry_run, max_concurrent=1)
     if not args.dry_run:
         report = read_artifact(steps[-1].output_path, CommonCrawlDocxSampleReport)
         print(f"Markdown report: {report.markdown_path}")

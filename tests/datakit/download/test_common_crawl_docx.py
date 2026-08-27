@@ -35,7 +35,7 @@ from marin.datakit.download.common_crawl_plan import (
 )
 from marin.datakit.download.common_crawl_warc import CommonCrawlWarcRecord, content_digest, main_record_from_index_row
 
-from experiments.datakit.common_crawl_docx_sample import sample_report_markdown
+from experiments.datakit.common_crawl_docx_sample import _partition_limits, sample_report_markdown
 
 CRAWL_ID = "CC-MAIN-2026-30"
 RECORD_ID = "<urn:uuid:019f8700-d21d-78d8-8eb1-99eaa22579da>"
@@ -430,6 +430,13 @@ def test_language_identification_removes_structural_blocks_from_output() -> None
 
     assert output["language"] == "en"
     assert "language_blocks" not in output
+
+
+def test_partition_limits_enforce_global_document_ceiling() -> None:
+    limits = _partition_limits(["a", "b", "c", "d", "e", "f"], 10_000)
+
+    assert limits == [("a", 1667), ("b", 1667), ("c", 1667), ("d", 1667), ("e", 1666), ("f", 1666)]
+    assert sum(limit for _, limit in limits) == 10_000
 
 
 def test_sample_report_reads_selection_reason_from_shared_discovery_metadata() -> None:

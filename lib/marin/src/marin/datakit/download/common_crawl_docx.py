@@ -190,6 +190,10 @@ class DoclingDocxExtractor:
 
     version: str = EXTRACTOR_VERSION
 
+    def initialize(self) -> None:
+        """Initialize the process-local Docling converter cache."""
+        _docling_converter()
+
     def extract(self, payload: bytes) -> ExtractedDocument:
         # Docling is an optional datakit dependency, so importing this module
         # must not require it until extraction is actually requested.
@@ -200,7 +204,12 @@ class DoclingDocxExtractor:
             result = _docling_converter().convert(DocumentStream(name="document.docx", stream=io.BytesIO(payload)))
         except (ConversionError, SecurityError) as error:
             raise DocxExtractionError("Docling failed to extract the DOCX payload") from error
-        return _extracted_document(result.document)
+        return extracted_docling_document(result.document)
+
+
+def reset_docling_converter() -> None:
+    """Clear the process-local converter cache for controlled lifecycle experiments."""
+    _docling_converter.cache_clear()
 
 
 @dataclass(frozen=True)
@@ -326,7 +335,8 @@ def _lingua_detector() -> Any:
     return LanguageDetectorBuilder.from_all_languages().build()
 
 
-def _extracted_document(document: Any) -> ExtractedDocument:
+def extracted_docling_document(document: Any) -> ExtractedDocument:
+    """Convert a Docling document model into the DOCX extraction contract."""
     from docling_core.types.doc.labels import DocItemLabel  # noqa: PLC0415
 
     non_table_content = document.export_to_markdown(labels=set(DocItemLabel) - {DocItemLabel.TABLE}).strip()
@@ -401,17 +411,13 @@ def extracted_docx_record(
     payload = fetched["payload"]
     if not isinstance(payload, bytes):
         raise TypeError("Fetched DOCX payload must be bytes")
-    validate_docx(
+    extracted = validated_extracted_docx(
         payload,
-        maximum_entries=maximum_zip_entries,
+        extractor=extractor,
+        maximum_zip_entries=maximum_zip_entries,
         maximum_uncompressed_bytes=maximum_uncompressed_bytes,
     )
-    extracted = extractor.extract(payload)
-    if not extracted.language_blocks:
-        raise DocxExtractionError("DOCX extractor returned no language blocks")
     text = extracted.text.strip()
-    if not text:
-        raise EmptyDocxTextError("DOCX extraction produced empty text")
     return {
         "text": text,
         "language_blocks": _language_block_spans(text, extracted.language_blocks),
@@ -421,6 +427,27 @@ def extracted_docx_record(
         "image_count": extracted.image_count,
         "extractor": extractor.version,
     }
+
+
+def validated_extracted_docx(
+    payload: bytes,
+    *,
+    extractor: DocxTextExtractor,
+    maximum_zip_entries: int,
+    maximum_uncompressed_bytes: int,
+) -> ExtractedDocument:
+    """Run the validation and extraction checks shared by production and profiling."""
+    validate_docx(
+        payload,
+        maximum_entries=maximum_zip_entries,
+        maximum_uncompressed_bytes=maximum_uncompressed_bytes,
+    )
+    extracted = extractor.extract(payload)
+    if not extracted.language_blocks:
+        raise DocxExtractionError("DOCX extractor returned no language blocks")
+    if not extracted.text.strip():
+        raise EmptyDocxTextError("DOCX extraction produced empty text")
+    return extracted
 
 
 def process_fetched_docx(
