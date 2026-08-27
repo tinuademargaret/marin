@@ -197,6 +197,17 @@ def test_marin_temp_bucket_falls_back_to_marin_prefix_when_no_region():
         assert result == "gs://marin-antarctica-south1/scratch/tmp"
 
 
+def test_marin_temp_bucket_explicit_private_gcs_prefix_overrides_vm_region():
+    with (
+        patch(
+            "rigging.filesystem.cluster_config.urllib.request.urlopen",
+            return_value=_mock_urlopen(b"projects/12345/zones/us-east1-c"),
+        ),
+        patch.dict(os.environ, {"MARIN_PREFIX": "gs://private-docx-bucket/profiling"}),
+    ):
+        assert marin_temp_bucket(ttl_days=1, prefix="zephyr") == ("gs://private-docx-bucket/profiling/tmp/zephyr")
+
+
 def test_marin_temp_bucket_local_fallback_when_unresolvable():
     with (
         patch("rigging.filesystem.cluster_config.urllib.request.urlopen", side_effect=OSError("not on GCP")),

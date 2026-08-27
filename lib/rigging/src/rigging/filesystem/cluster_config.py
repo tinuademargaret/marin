@@ -521,7 +521,8 @@ def marin_temp_bucket(ttl_days: int, prefix: str = "", *, source_prefix: str | N
         region = region_from_prefix(source_prefix)
         s3_bucket = _s3_bucket_from_prefix(source_prefix)
     else:
-        region = marin_region() if mp.startswith("gs://") else None
+        explicit_prefix = os.environ.get(_MARIN_PREFIX_ENV)
+        region = region_from_prefix(mp) if explicit_prefix else marin_region() if mp.startswith("gs://") else None
         s3_bucket = _s3_bucket_from_prefix(mp)
 
     if region:
