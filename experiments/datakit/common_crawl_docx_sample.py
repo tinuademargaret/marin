@@ -52,8 +52,11 @@ from zephyr.execution import ZephyrContext
 from experiments.datakit.common_crawl_docx_profile import (
     DocxExtractionProfileConfig,
     common_crawl_docx_profile_steps,
+    default_profile_shard_counts,
+    natural_layout_variants,
     persistence_variants,
     scaling_variants,
+    worker_shard_size_variants,
 )
 
 DEFAULT_INDEX_PARTITIONS = 6
@@ -491,6 +494,7 @@ def main() -> None:
     parser.add_argument("--max-workers", type=int, default=24)
     parser.add_argument("--profile-worker-counts", type=int, nargs="+", default=DEFAULT_PROFILE_WORKER_COUNTS)
     parser.add_argument("--profile-target-shards", type=int, default=DEFAULT_PROFILE_TARGET_SHARDS)
+    parser.add_argument("--profile-shard-counts", type=int, nargs="+")
     parser.add_argument("--skip-profile", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -516,12 +520,20 @@ def main() -> None:
     )
     terminals = [steps[-1]]
     if not args.skip_profile:
+        worker_counts = tuple(args.profile_worker_counts)
+        shard_counts = tuple(args.profile_shard_counts or default_profile_shard_counts(args.profile_target_shards))
         profile_variants = (
             *scaling_variants(
                 target_shards=args.profile_target_shards,
-                worker_counts=tuple(args.profile_worker_counts),
+                worker_counts=worker_counts,
             ),
-            *persistence_variants(),
+            *natural_layout_variants(worker_counts),
+            *worker_shard_size_variants(
+                worker_counts=worker_counts,
+                target_shards=shard_counts,
+                scaling_target_shards=args.profile_target_shards,
+            ),
+            *persistence_variants(target_shards=args.profile_target_shards),
         )
         _, _, profile_report = common_crawl_docx_profile_steps(
             DocxExtractionProfileConfig(

@@ -6,8 +6,6 @@
 import argparse
 import json
 import math
-import os
-import socket
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -41,19 +39,28 @@ from rigging.filesystem import prefix_join, url_to_fs
 from zephyr import counters
 from zephyr.dataset import Dataset, ShardInfo
 from zephyr.execution import ZephyrContext
-from zephyr.runners import SubprocessRunner
+from zephyr.runners import InlineRunner, SubprocessRunner
 
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
 DEFAULT_WORKER_COUNTS = (1, 2, 4, 8, 16)
 DEFAULT_PREPARATION_SHARDS = 128
 _MEBIBYTE = 1 << 20
+_PERSISTENT_CONVERTER_RUNS: set[str] = set()
+_PERSISTENT_CONVERTER_LOCK = threading.Lock()
 
 
 class ConverterLifecycle(StrEnum):
     """Converter lifetime used by one profiling run."""
 
-    PER_TASK = "per_task"
-    PER_INPUT_SHARD = "per_input_shard"
+    PER_SHARD = "per_shard"
+    PER_WORKER = "per_worker"
+
+
+class RunnerMode(StrEnum):
+    """Isolation boundary used to execute extraction shards."""
+
+    SUBPROCESS = "subprocess"
+    INLINE = "inline"
 
 
 class VariantRole(StrEnum):
@@ -63,6 +70,14 @@ class VariantRole(StrEnum):
     SCALING = "scaling"
     PERSISTENCE = "persistence"
     SHARD_SIZE = "shard_size"
+    NATURAL_LAYOUT = "natural_layout"
+
+
+class ProfileLayout(StrEnum):
+    """Physical payload layout consumed by a profiling run."""
+
+    PREPARED = "prepared"
+    NATURAL = "natural"
 
 
 @dataclass(frozen=True)
@@ -71,25 +86,35 @@ class DocxExtractionProfileVariant:
 
     name: str
     worker_count: int
-    target_shards: int
+    target_shards: int | None
     role: VariantRole
-    lifecycle: ConverterLifecycle = ConverterLifecycle.PER_TASK
+    layout: ProfileLayout = ProfileLayout.PREPARED
+    lifecycle: ConverterLifecycle = ConverterLifecycle.PER_SHARD
+    runner: RunnerMode = RunnerMode.SUBPROCESS
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("name must not be empty")
-        if self.worker_count <= 0 or self.target_shards <= 0:
-            raise ValueError("worker_count and target_shards must be positive")
+        if self.worker_count <= 0:
+            raise ValueError("worker_count must be positive")
+        if self.layout is ProfileLayout.PREPARED and (self.target_shards is None or self.target_shards <= 0):
+            raise ValueError("prepared variants require positive target_shards")
+        if self.layout is ProfileLayout.NATURAL and self.target_shards is not None:
+            raise ValueError("natural-layout variants must not set target_shards")
+        if self.lifecycle is ConverterLifecycle.PER_WORKER and self.runner is not RunnerMode.INLINE:
+            raise ValueError("a persistent worker converter requires the inline runner")
 
     @property
-    def hash_attrs(self) -> dict[str, str | int]:
+    def hash_attrs(self) -> dict[str, str | int | None]:
         """Return the JSON-compatible identity used by Marin step hashing."""
         return {
             "name": self.name,
             "worker_count": self.worker_count,
             "target_shards": self.target_shards,
             "role": self.role.value,
+            "layout": self.layout.value,
             "lifecycle": self.lifecycle.value,
+            "runner": self.runner.value,
         }
 
 
@@ -110,6 +135,11 @@ class DocxExtractionProfileConfig:
             raise ValueError("preparation_shards must be positive")
         if len({variant.name for variant in self.variants}) != len(self.variants):
             raise ValueError("variant names must be unique")
+        prepared_targets = [
+            variant.target_shards for variant in self.variants if variant.layout is ProfileLayout.PREPARED
+        ]
+        if any(target is not None and target > self.preparation_shards for target in prepared_targets):
+            raise ValueError("prepared variant target_shards cannot exceed preparation_shards")
 
 
 class DocxExtractionProfileRun(BaseModel):
@@ -118,8 +148,10 @@ class DocxExtractionProfileRun(BaseModel):
     metrics_dir: str
     variant: str
     worker_count: int
-    target_shards: int
+    target_shards: int | None
+    layout: str
     lifecycle: str
+    runner: str
     counters: dict[str, int | float]
 
 
@@ -146,10 +178,11 @@ PROFILE_ROW_SCHEMA = pa.schema(
         pa.field("variant", pa.string(), nullable=False),
         pa.field("variant_role", pa.string(), nullable=False),
         pa.field("worker_count", pa.int32(), nullable=False),
-        pa.field("target_shards", pa.int32(), nullable=False),
+        pa.field("target_shards", pa.int32()),
+        pa.field("layout", pa.string(), nullable=False),
         pa.field("lifecycle", pa.string(), nullable=False),
+        pa.field("runner", pa.string(), nullable=False),
         pa.field("shard_idx", pa.int32(), nullable=False),
-        pa.field("worker_id", pa.string(), nullable=False),
         pa.field("source_file", pa.string()),
         pa.field("source_id", pa.string()),
         pa.field("success", pa.bool_()),
@@ -192,51 +225,49 @@ def scaling_variants(
     )
 
 
-def persistence_variants() -> tuple[DocxExtractionProfileVariant, ...]:
-    """Build a single-process cold-versus-warm converter comparison."""
+def persistence_variants(*, target_shards: int) -> tuple[DocxExtractionProfileVariant, ...]:
+    """Build the persistent-worker treatment paired with the one-worker scaling baseline."""
     return (
         DocxExtractionProfileVariant(
-            name="persistence-cold",
+            name="persistence-worker",
             worker_count=1,
-            target_shards=1,
+            target_shards=target_shards,
             role=VariantRole.PERSISTENCE,
-            lifecycle=ConverterLifecycle.PER_INPUT_SHARD,
-        ),
-        DocxExtractionProfileVariant(
-            name="persistence-warm",
-            worker_count=1,
-            target_shards=1,
-            role=VariantRole.PERSISTENCE,
-            lifecycle=ConverterLifecycle.PER_TASK,
+            lifecycle=ConverterLifecycle.PER_WORKER,
+            runner=RunnerMode.INLINE,
         ),
     )
 
 
-def shard_size_variants(
-    target_shards: Mapping[str, int], *, worker_count: int
-) -> tuple[DocxExtractionProfileVariant, ...]:
-    """Build calibrated shard-size variants such as 1m, 5m, 15m, and 30m."""
+def natural_layout_variants(worker_counts: Sequence[int]) -> tuple[DocxExtractionProfileVariant, ...]:
+    """Build worker-scaling treatments over the fetched corpus's physical files."""
     return tuple(
         DocxExtractionProfileVariant(
-            name=f"shard-{label}",
-            worker_count=worker_count,
+            name=f"natural-{workers}",
+            worker_count=workers,
+            target_shards=None,
+            role=VariantRole.NATURAL_LAYOUT,
+            layout=ProfileLayout.NATURAL,
+        )
+        for workers in worker_counts
+    )
+
+
+def worker_shard_size_variants(
+    *, worker_counts: Sequence[int], target_shards: Sequence[int], scaling_target_shards: int | None = None
+) -> tuple[DocxExtractionProfileVariant, ...]:
+    """Build the worker-by-shard-count matrix used to select shard size."""
+    return tuple(
+        DocxExtractionProfileVariant(
+            name=f"shard-w{workers}-s{shards}",
+            worker_count=workers,
             target_shards=shards,
             role=VariantRole.SHARD_SIZE,
         )
-        for label, shards in target_shards.items()
+        for workers in worker_counts
+        for shards in target_shards
+        if shards != scaling_target_shards
     )
-
-
-def calibrated_shard_targets(
-    *, total_shard_seconds: float, input_shards: int, target_minutes: Sequence[int]
-) -> dict[str, int]:
-    """Translate desired shard durations into achievable counts using a calibration run."""
-    if total_shard_seconds <= 0 or input_shards <= 0:
-        raise ValueError("total_shard_seconds and input_shards must be positive")
-    return {
-        f"{minutes}m": min(input_shards, max(1, math.ceil(total_shard_seconds / (minutes * 60))))
-        for minutes in target_minutes
-    }
 
 
 def _profile_partition_key(record: Mapping[str, object]) -> str:
@@ -295,6 +326,7 @@ def profile_extraction_shard(
     paths: Iterator[str],
     shard: ShardInfo,
     *,
+    run_token: str,
     variant: DocxExtractionProfileVariant,
     maximum_zip_entries: int,
     maximum_uncompressed_bytes: int,
@@ -308,7 +340,6 @@ def profile_extraction_shard(
     peak_rss = initial_rss
     process.cpu_percent()
     peak_cpu_percent = 0.0
-    worker_id = _worker_identity()
     read_wall = 0.0
     initialization_wall = 0.0
     initialization_cpu = 0.0
@@ -320,12 +351,17 @@ def profile_extraction_shard(
 
     for path in paths:
         input_files += 1
-        if variant.lifecycle is ConverterLifecycle.PER_INPUT_SHARD or initializations == 0:
+        if initializations == 0 and variant.lifecycle is ConverterLifecycle.PER_SHARD:
             reset_docling_converter()
             wall_seconds, cpu_seconds = _initialize_extractor(extractor)
             initialization_wall += wall_seconds
             initialization_cpu += cpu_seconds
             initializations += 1
+        elif variant.lifecycle is ConverterLifecycle.PER_WORKER:
+            wall_seconds, cpu_seconds, initialized = _initialize_persistent_extractor(run_token, extractor)
+            initialization_wall += wall_seconds
+            initialization_cpu += cpu_seconds
+            initializations += initialized
         read_start = time.perf_counter()
         with fsspec.open(path, "rb") as stream:
             records = pq.read_table(stream).to_pylist()
@@ -361,7 +397,6 @@ def profile_extraction_shard(
                 row_kind="document",
                 variant=variant,
                 shard_idx=shard.shard_idx,
-                worker_id=worker_id,
                 source_file=path,
                 source_id=str(record.get("source_id", "")),
                 success=success,
@@ -379,7 +414,6 @@ def profile_extraction_shard(
         row_kind="shard",
         variant=variant,
         shard_idx=shard.shard_idx,
-        worker_id=worker_id,
         converter_initialization_wall_seconds=initialization_wall,
         converter_initialization_cpu_seconds=initialization_cpu,
         converter_initializations=initializations,
@@ -405,11 +439,14 @@ def _initialize_extractor(extractor: DoclingDocxExtractor) -> tuple[float, float
     return time.perf_counter() - wall_start, time.process_time() - cpu_start
 
 
-def _worker_identity() -> str:
-    iris_task_id = os.environ.get("IRIS_TASK_ID")
-    if iris_task_id:
-        return iris_task_id
-    return f"{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}"
+def _initialize_persistent_extractor(run_token: str, extractor: DoclingDocxExtractor) -> tuple[float, float, int]:
+    with _PERSISTENT_CONVERTER_LOCK:
+        if run_token in _PERSISTENT_CONVERTER_RUNS:
+            return 0.0, 0.0, 0
+        reset_docling_converter()
+        wall_seconds, cpu_seconds = _initialize_extractor(extractor)
+        _PERSISTENT_CONVERTER_RUNS.add(run_token)
+        return wall_seconds, cpu_seconds, 1
 
 
 def _profile_row(
@@ -426,7 +463,9 @@ def _profile_row(
         variant_role=variant.role.value,
         worker_count=variant.worker_count,
         target_shards=variant.target_shards,
+        layout=variant.layout.value,
         lifecycle=variant.lifecycle.value,
+        runner=variant.runner.value,
         shard_idx=shard_idx,
         **values,
     )
@@ -436,41 +475,43 @@ def _profile_row(
 def run_extraction_profile(
     output_path: str,
     *,
-    prepared_input_path: str,
+    input_path: str,
     variant: DocxExtractionProfileVariant,
     maximum_zip_entries: int,
     maximum_uncompressed_bytes: int,
 ) -> DocxExtractionProfileRun:
     """Run one extraction profiling treatment over the fixed fetched corpus."""
-    pipeline = (
-        Dataset.from_files(prefix_join(prepared_input_path, "data/**/*.parquet"))
-        .reshard(variant.target_shards)
-        .map_shard(
-            partial(
-                profile_extraction_shard,
-                variant=variant,
-                maximum_zip_entries=maximum_zip_entries,
-                maximum_uncompressed_bytes=maximum_uncompressed_bytes,
-            )
+    dataset = Dataset.from_files(prefix_join(input_path, "data/**/*.parquet"))
+    if variant.layout is ProfileLayout.PREPARED:
+        assert variant.target_shards is not None
+        dataset = dataset.reshard(variant.target_shards)
+    pipeline = dataset.map_shard(
+        partial(
+            profile_extraction_shard,
+            run_token=output_path,
+            variant=variant,
+            maximum_zip_entries=maximum_zip_entries,
+            maximum_uncompressed_bytes=maximum_uncompressed_bytes,
         )
-        .write_parquet(
-            prefix_join(output_path, "metrics/part-{shard:05d}-of-{total:05d}.parquet"),
-            schema=PROFILE_ROW_SCHEMA,
-            skip_existing=True,
-        )
+    ).write_parquet(
+        prefix_join(output_path, "metrics/part-{shard:05d}-of-{total:05d}.parquet"),
+        schema=PROFILE_ROW_SCHEMA,
+        skip_existing=True,
     )
     outcome = ZephyrContext(
         name=f"common-crawl-docx-profile-{variant.name}",
         resources=ResourceConfig(cpu=2, ram="16g"),
         max_workers=variant.worker_count,
-        stage_runner_factory=SubprocessRunner,
+        stage_runner_factory=InlineRunner if variant.runner is RunnerMode.INLINE else SubprocessRunner,
     ).execute(pipeline)
     return DocxExtractionProfileRun(
         metrics_dir=prefix_join(output_path, "metrics"),
         variant=variant.name,
         worker_count=variant.worker_count,
         target_shards=variant.target_shards,
+        layout=variant.layout.value,
         lifecycle=variant.lifecycle.value,
+        runner=variant.runner.value,
         counters=dict(outcome.counters),
     )
 
@@ -482,11 +523,12 @@ class RunMetrics:
     variant: str
     variant_role: str
     worker_count: int
-    observed_workers: int
     peak_concurrency: int
-    target_shards: int
+    target_shards: int | None
     observed_shards: int
+    layout: str
     lifecycle: str
+    runner: str
     documents: int
     failures: int
     payload_bytes: int
@@ -533,7 +575,6 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
     finishes = np.asarray([float(row["finished_at"]) for row in shards])
     stage_wall = float(finishes.max() - starts.min())
     worker_count = int(shards[0]["worker_count"])
-    worker_ids = {str(row["worker_id"]) for row in shards}
     peak_concurrency = _observed_peak_concurrency(starts, finishes)
     conversion_total = float(conversion_times.sum())
     initialization_total = sum(float(row["converter_initialization_wall_seconds"]) for row in shards)
@@ -543,11 +584,12 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
         variant=str(shards[0]["variant"]),
         variant_role=str(shards[0]["variant_role"]),
         worker_count=worker_count,
-        observed_workers=len(worker_ids),
         peak_concurrency=peak_concurrency,
-        target_shards=int(shards[0]["target_shards"]),
+        target_shards=int(shards[0]["target_shards"]) if shards[0]["target_shards"] is not None else None,
         observed_shards=len(shards),
+        layout=str(shards[0]["layout"]),
         lifecycle=str(shards[0]["lifecycle"]),
+        runner=str(shards[0]["runner"]),
         documents=len(documents),
         failures=sum(not bool(row["success"]) for row in documents),
         payload_bytes=sum(int(row["payload_bytes"]) for row in documents),
@@ -579,7 +621,7 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
         maximum_document_share=max(table.values(), default=0.0),
         maximum_document_share_percentiles=_percentiles(np.asarray(list(table.values())), (50, 95, 99, 100)),
         worker_utilization=_divide(float(shard_times.sum()), peak_concurrency * stage_wall),
-        terminal_idle_fraction=_terminal_idle_fraction(shards),
+        terminal_idle_fraction=_terminal_slot_idle_fraction(starts, finishes, peak_concurrency),
         read_fraction=_divide(sum(float(row["read_wall_seconds"]) for row in shards), float(shard_times.sum())),
         conversion_fraction=_divide(conversion_total, float(shard_times.sum())),
         document_percentiles=_percentiles(conversion_times, (50, 90, 95, 99, 99.9, 100)),
@@ -603,15 +645,16 @@ def _percentiles(values: np.ndarray, percentiles: Sequence[float]) -> dict[str, 
     return {f"p{percentile:g}": float(np.percentile(values, percentile)) for percentile in percentiles}
 
 
-def _terminal_idle_fraction(shards: Sequence[Mapping[str, object]]) -> float:
-    stage_start = min(float(row["started_at"]) for row in shards)
-    stage_finish = max(float(row["finished_at"]) for row in shards)
-    worker_finishes: dict[str, float] = {}
-    for row in shards:
-        worker_id = str(row["worker_id"])
-        worker_finishes[worker_id] = max(worker_finishes.get(worker_id, stage_start), float(row["finished_at"]))
-    terminal_idle = sum(stage_finish - finish for finish in worker_finishes.values())
-    return _divide(terminal_idle, len(worker_finishes) * (stage_finish - stage_start))
+def _terminal_slot_idle_fraction(starts: np.ndarray, finishes: np.ndarray, slot_count: int) -> float:
+    """Measure unused concurrency after the final queued shard has started."""
+    terminal_start = float(starts.max())
+    stage_finish = float(finishes.max())
+    terminal_capacity = slot_count * (stage_finish - terminal_start)
+    terminal_busy = sum(
+        max(0.0, float(finish) - max(float(start), terminal_start))
+        for start, finish in zip(starts, finishes, strict=True)
+    )
+    return _divide(terminal_capacity - terminal_busy, terminal_capacity)
 
 
 def _observed_peak_concurrency(starts: np.ndarray, finishes: np.ndarray) -> int:
@@ -761,7 +804,6 @@ def profile_summary(
             {
                 "variant": metric.variant,
                 "requested_workers": metric.worker_count,
-                "observed_workers": metric.observed_workers,
                 "peak_concurrency": metric.peak_concurrency,
                 "speedup": speedup,
                 "efficiency": _divide(speedup, metric.peak_concurrency),
@@ -771,8 +813,9 @@ def profile_summary(
         (
             metric
             for metric in metrics
-            if metric.variant_role == VariantRole.PERSISTENCE.value
-            and metric.lifecycle == ConverterLifecycle.PER_INPUT_SHARD.value
+            if metric.variant_role == VariantRole.SCALING.value
+            and metric.worker_count == 1
+            and metric.runner == RunnerMode.SUBPROCESS.value
         ),
         None,
     )
@@ -781,7 +824,7 @@ def profile_summary(
             metric
             for metric in metrics
             if metric.variant_role == VariantRole.PERSISTENCE.value
-            and metric.lifecycle == ConverterLifecycle.PER_TASK.value
+            and metric.lifecycle == ConverterLifecycle.PER_WORKER.value
         ),
         None,
     )
@@ -797,6 +840,7 @@ def profile_summary(
         "runs": [metric.as_dict() for metric in metrics],
         "scaling": scaling,
         "persistence": persistence,
+        "optimal_shards": [_optimal_shard_summary(metric) for metric in _optimal_shard_sizes(metrics)],
         "zephyr_counters": dict(counters_by_variant or {}),
     }
 
@@ -812,14 +856,15 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
         "",
         "## Run overview",
         "",
-        "| Run | Requested workers | Observed workers | Peak concurrency | Prepared/observed shards | Documents | "
+        "| Run | Layout | Runner | Requested workers | Peak concurrency | Target/observed shards | Documents | "
         "Wall time | Docs/s | Init | Read | Conversion | Utilization | Terminal idle |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for metric in metrics:
         lines.append(
-            f"| `{metric.variant}` | {metric.worker_count} | {metric.observed_workers} | {metric.peak_concurrency} | "
-            f"{metric.target_shards}/{metric.observed_shards} | {metric.documents:,} | "
+            f"| `{metric.variant}` | {metric.layout} | {metric.runner} | {metric.worker_count} | "
+            f"{metric.peak_concurrency} | {_target_shard_label(metric)}/{metric.observed_shards} | "
+            f"{metric.documents:,} | "
             f"{_duration(metric.stage_wall_seconds)} | {_divide(metric.documents, metric.stage_wall_seconds):.2f} | "
             f"{metric.initialization_fraction:.1%} | {metric.read_fraction:.1%} | {metric.conversion_fraction:.1%} | "
             f"{metric.worker_utilization:.1%} | {metric.terminal_idle_fraction:.1%} |"
@@ -877,34 +922,60 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
     if isinstance(scaling, list) and scaling:
         lines.extend(
             [
-                "| Requested | Observed | Peak concurrency | Speedup | Parallel efficiency |",
-                "| ---: | ---: | ---: | ---: | ---: |",
+                "| Requested | Peak concurrency | Speedup | Parallel efficiency |",
+                "| ---: | ---: | ---: | ---: |",
             ]
         )
         for row in scaling:
             assert isinstance(row, dict)
             lines.append(
-                f"| {row['requested_workers']} | {row['observed_workers']} | {row['peak_concurrency']} | "
+                f"| {row['requested_workers']} | {row['peak_concurrency']} | "
                 f"{row['speedup']:.2f}x | {row['efficiency']:.1%} |"
             )
     else:
         lines.append("Scaling variants were not included.")
+    natural = sorted(
+        (metric for metric in metrics if metric.layout == ProfileLayout.NATURAL.value),
+        key=lambda metric: metric.worker_count,
+    )
+    lines.extend(["", "## Natural fetched layout", ""])
+    if natural:
+        lines.extend(
+            [
+                "| Workers | Physical shards | Wall time | Initialization | Peak concurrency |",
+                "| ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for metric in natural:
+            lines.append(
+                f"| {metric.worker_count} | {metric.observed_shards} | {_duration(metric.stage_wall_seconds)} | "
+                f"{metric.initialization_fraction:.1%} | {metric.peak_concurrency} |"
+            )
+    else:
+        lines.append("Natural-layout variants were not included.")
     lines.extend(["", "## Shard-size choice", ""])
-    shard_choice = _recommended_shard_size(metrics)
-    if shard_choice is None:
+    shard_choices = _optimal_shard_sizes(metrics)
+    if not shard_choices:
         lines.append("Shard-size variants were not included.")
     else:
-        lines.append(
-            f"Choose `{shard_choice.variant}` among the measured points: its median shard is "
-            f"{_duration(shard_choice.shard_percentiles['p50'])}, initialization is "
-            f"{shard_choice.initialization_fraction:.1%}, and terminal idle is "
-            f"{shard_choice.terminal_idle_fraction:.1%}."
+        lines.extend(
+            [
+                "| Workers | Selected run | Shards | Documents/shard | Initialization | Target met |",
+                "| ---: | --- | ---: | ---: | ---: | --- |",
+            ]
         )
+        for choice in shard_choices:
+            lines.append(
+                f"| {choice.worker_count} | `{choice.variant}` | {choice.observed_shards} | "
+                f"{_divide(choice.documents, choice.observed_shards):.1f} | "
+                f"{choice.initialization_fraction:.1%} | "
+                f"{'yes' if choice.initialization_fraction <= 0.10 else 'no'} |"
+            )
     lines.extend(["", "## Persistent converter experiment", ""])
     persistence = summary.get("persistence")
     if isinstance(persistence, dict):
         lines.append(
-            f"Warm conversion speedup is {persistence['speedup']:.2f}x, saving "
+            f"Persistent-worker speedup is {persistence['speedup']:.2f}x, saving "
             f"{_duration(float(persistence['savings_seconds']))} ({persistence['percent_saved']:.1%}). "
             f"Warm-process RSS growth is {_representative_persistence_growth(metrics):.1f} MiB per 1,000 documents."
         )
@@ -917,14 +988,14 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
             "",
             "- Read time includes Parquet access and decoding. Conversion time includes DOCX validation and "
             "Docling conversion.",
-            "- Worker utilization and terminal idle use observed Zephyr worker-process identities and shard intervals, "
-            "not requested capacity.",
+            "- Worker utilization and terminal idle are derived from the measured concurrency timeline. Terminal idle "
+            "starts when the final queued shard begins; task-process PIDs are not treated as workers.",
             "- Cross-worker stage wall time uses wall clocks and can contain small clock-skew error.",
             "- Peak CPU is sampled at document boundaries; use Zephyr finelog CPU time as the primary A/B cost signal.",
             "- Task retries are not present in successful output rows; obtain them from coordinator logs and "
             "finelog before a final decision.",
-            "- The cold persistence treatment clears the production converter cache, but does not repeat Python "
-            "imports for every logical input shard.",
+            "- The persistent-worker treatment clears any inherited converter before its first shard, then reuses "
+            "the process-local converter. It does not repeat Python imports for every shard.",
             "- Output writing occurs after rows are yielded and is represented in Zephyr stage statistics, "
             "not shard conversion rows.",
             "- Compare CPU-seconds per document across code changes; use wall time for scaling and straggler "
@@ -961,8 +1032,10 @@ def _dashboard_html(rows: Sequence[Mapping[str, object]], metrics: Sequence[RunM
         _timeline_figure(shards),
         _decomposition_figure(metrics),
         _scaling_figure(metrics),
+        _natural_layout_figure(metrics),
         _persistence_figure(metrics),
         _shard_size_figure(metrics),
+        _optimal_shard_size_figure(metrics),
     ]
     sections: list[str] = []
     for index, (title, figure) in enumerate(figures):
@@ -1069,7 +1142,12 @@ def _scaling_figure(metrics: Sequence[RunMetrics]) -> tuple[str, go.Figure]:
 
 
 def _persistence_figure(metrics: Sequence[RunMetrics]) -> tuple[str, go.Figure]:
-    persistence = [metric for metric in metrics if metric.variant_role == VariantRole.PERSISTENCE.value]
+    persistence = [
+        metric
+        for metric in metrics
+        if metric.variant_role == VariantRole.PERSISTENCE.value
+        or (metric.variant_role == VariantRole.SCALING.value and metric.worker_count == 1)
+    ]
     figure = go.Figure(
         go.Bar(x=[metric.variant for metric in persistence], y=[metric.stage_wall_seconds for metric in persistence])
     )
@@ -1077,9 +1155,32 @@ def _persistence_figure(metrics: Sequence[RunMetrics]) -> tuple[str, go.Figure]:
     return "Cold versus warm converter", figure
 
 
+def _natural_layout_figure(metrics: Sequence[RunMetrics]) -> tuple[str, go.Figure]:
+    natural = sorted(
+        (metric for metric in metrics if metric.layout == ProfileLayout.NATURAL.value),
+        key=lambda metric: metric.worker_count,
+    )
+    prepared = sorted(
+        (metric for metric in metrics if metric.variant_role == VariantRole.SCALING.value),
+        key=lambda metric: metric.worker_count,
+    )
+    figure = go.Figure()
+    for label, runs in (("Natural", natural), ("Prepared", prepared)):
+        figure.add_trace(
+            go.Scatter(
+                x=[metric.worker_count for metric in runs],
+                y=[metric.stage_wall_seconds for metric in runs],
+                name=label,
+                mode="lines+markers",
+            )
+        )
+    figure.update_layout(xaxis_title="Requested workers", yaxis_title="Stage wall seconds")
+    return "Natural versus prepared layout", figure
+
+
 def _shard_size_figure(metrics: Sequence[RunMetrics]) -> tuple[str, go.Figure]:
     shard_runs = sorted(
-        (metric for metric in metrics if metric.variant_role == VariantRole.SHARD_SIZE.value),
+        (metric for metric in metrics if _is_shard_size_candidate(metric)),
         key=lambda metric: metric.shard_percentiles["p50"],
     )
     figure = go.Figure()
@@ -1107,25 +1208,75 @@ def _shard_size_figure(metrics: Sequence[RunMetrics]) -> tuple[str, go.Figure]:
     return "Shard-size tradeoff", figure
 
 
+def _optimal_shard_size_figure(metrics: Sequence[RunMetrics]) -> tuple[str, go.Figure]:
+    optimal = _optimal_shard_sizes(metrics)
+    figure = go.Figure(
+        go.Scatter(
+            x=[metric.worker_count for metric in optimal],
+            y=[_divide(metric.documents, metric.observed_shards) for metric in optimal],
+            text=[
+                f"{metric.observed_shards} shards; initialization {metric.initialization_fraction:.1%}"
+                for metric in optimal
+            ],
+            mode="lines+markers",
+            marker={"color": ["#2ca02c" if metric.initialization_fraction <= 0.10 else "#d62728" for metric in optimal]},
+        )
+    )
+    figure.update_layout(xaxis_title="Requested workers", yaxis_title="Selected documents per shard")
+    return "Workers versus optimal measured shard size", figure
+
+
 def _representative_persistence_growth(metrics: Sequence[RunMetrics]) -> float:
     warm = next(
         (
             metric
             for metric in metrics
             if metric.variant_role == VariantRole.PERSISTENCE.value
-            and metric.lifecycle == ConverterLifecycle.PER_TASK.value
+            and metric.lifecycle == ConverterLifecycle.PER_WORKER.value
         ),
         None,
     )
     return 0.0 if warm is None else warm.rss_growth_per_1000_documents / _MEBIBYTE
 
 
+def _optimal_shard_sizes(metrics: Sequence[RunMetrics]) -> list[RunMetrics]:
+    selected: list[RunMetrics] = []
+    worker_counts = sorted({metric.worker_count for metric in metrics if _is_shard_size_candidate(metric)})
+    for workers in worker_counts:
+        candidates = [
+            metric for metric in metrics if _is_shard_size_candidate(metric) and metric.worker_count == workers
+        ]
+        amortized = [metric for metric in candidates if metric.initialization_fraction <= 0.10]
+        selected.append(
+            max(amortized, key=lambda metric: metric.observed_shards)
+            if amortized
+            else min(candidates, key=lambda metric: metric.initialization_fraction)
+        )
+    return selected
+
+
+def _is_shard_size_candidate(metric: RunMetrics) -> bool:
+    return metric.variant_role in {VariantRole.SHARD_SIZE.value, VariantRole.SCALING.value}
+
+
 def _recommended_shard_size(metrics: Sequence[RunMetrics]) -> RunMetrics | None:
-    candidates = [metric for metric in metrics if metric.variant_role == VariantRole.SHARD_SIZE.value]
-    amortized = [metric for metric in candidates if metric.initialization_fraction < 0.10]
-    if amortized:
-        return min(amortized, key=lambda metric: metric.shard_percentiles["p50"])
-    return min(candidates, key=lambda metric: metric.initialization_fraction) if candidates else None
+    optimal = _optimal_shard_sizes(metrics)
+    return max(optimal, key=lambda metric: metric.worker_count) if optimal else None
+
+
+def _optimal_shard_summary(metric: RunMetrics) -> dict[str, object]:
+    return {
+        "workers": metric.worker_count,
+        "variant": metric.variant,
+        "shards": metric.observed_shards,
+        "documents_per_shard": _divide(metric.documents, metric.observed_shards),
+        "initialization_fraction": metric.initialization_fraction,
+        "meets_initialization_target": metric.initialization_fraction <= 0.10,
+    }
+
+
+def _target_shard_label(metric: RunMetrics) -> str:
+    return "natural" if metric.target_shards is None else str(metric.target_shards)
 
 
 def common_crawl_docx_profile_steps(
@@ -1154,7 +1305,9 @@ def common_crawl_docx_profile_steps(
             fn=remote(
                 partial(
                     run_extraction_profile,
-                    prepared_input_path=preparation.output_path,
+                    input_path=(
+                        preparation.output_path if variant.layout is ProfileLayout.PREPARED else fetched.output_path
+                    ),
                     variant=variant,
                     maximum_zip_entries=config.maximum_zip_entries,
                     maximum_uncompressed_bytes=config.maximum_uncompressed_bytes,
@@ -1162,7 +1315,7 @@ def common_crawl_docx_profile_steps(
                 resources=ResourceConfig(cpu=1, ram="4g"),
                 pip_dependency_groups=["datakit"],
             ),
-            deps=[preparation],
+            deps=[preparation] if variant.layout is ProfileLayout.PREPARED else [fetched],
             hash_attrs={
                 "variant": variant.hash_attrs,
                 "maximum_zip_entries": config.maximum_zip_entries,
@@ -1176,7 +1329,7 @@ def common_crawl_docx_profile_steps(
         name=f"profiling/common-crawl-docx/{slug}/report",
         fn=partial(render_profile_report, run_paths=tuple(run.output_path for run in runs)),
         deps=list(runs),
-        hash_attrs={"report_version": 1},
+        hash_attrs={"report_version": 2},
     )
     return preparation, runs, report
 
@@ -1188,17 +1341,11 @@ def _comma_separated_ints(value: str) -> tuple[int, ...]:
     return values
 
 
-def _shard_targets(value: str) -> dict[str, int]:
-    targets: dict[str, int] = {}
-    try:
-        for item in value.split(","):
-            label, count = item.split("=", maxsplit=1)
-            targets[label] = int(count)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("expected LABEL=SHARDS entries separated by commas") from error
-    if not targets or any(not label or count <= 0 for label, count in targets.items()):
-        raise argparse.ArgumentTypeError("shard labels and counts must be non-empty and positive")
-    return targets
+def default_profile_shard_counts(maximum_shards: int) -> tuple[int, ...]:
+    """Return logarithmically spaced shard counts up to the prepared maximum."""
+    if maximum_shards <= 0:
+        raise ValueError("maximum_shards must be positive")
+    return tuple(sorted({max(1, maximum_shards // divisor) for divisor in (8, 4, 2, 1)}))
 
 
 def main() -> None:
@@ -1208,9 +1355,7 @@ def main() -> None:
     parser.add_argument("--name", default="docx-extraction-profile")
     parser.add_argument("--worker-counts", type=_comma_separated_ints, default=DEFAULT_WORKER_COUNTS)
     parser.add_argument("--target-shards", type=int)
-    parser.add_argument("--shard-size-targets", type=_shard_targets)
-    parser.add_argument("--shard-minutes", type=_comma_separated_ints, default=(1, 5, 15, 30))
-    parser.add_argument("--shard-size-workers", type=int, default=max(DEFAULT_WORKER_COUNTS))
+    parser.add_argument("--shard-counts", type=_comma_separated_ints)
     parser.add_argument("--skip-persistence", action="store_true")
     parser.add_argument("--maximum-zip-entries", type=int, default=DEFAULT_MAXIMUM_ZIP_ENTRIES)
     parser.add_argument("--maximum-uncompressed-bytes", type=int, default=DEFAULT_MAXIMUM_UNCOMPRESSED_BYTES)
@@ -1223,11 +1368,19 @@ def main() -> None:
     if input_shards == 0:
         raise FileNotFoundError(f"No fetched Parquet shards match {input_glob}")
     target_shards = args.target_shards or DEFAULT_PREPARATION_SHARDS
-    variants = list(scaling_variants(target_shards=target_shards, worker_counts=args.worker_counts))
+    worker_counts = tuple(args.worker_counts)
+    variants = list(scaling_variants(target_shards=target_shards, worker_counts=worker_counts))
+    variants.extend(natural_layout_variants(worker_counts))
+    shard_counts = tuple(args.shard_counts or default_profile_shard_counts(target_shards))
+    variants.extend(
+        worker_shard_size_variants(
+            worker_counts=worker_counts,
+            target_shards=shard_counts,
+            scaling_target_shards=target_shards,
+        )
+    )
     if not args.skip_persistence and target_shards > 1:
-        variants.extend(persistence_variants())
-    if args.shard_size_targets:
-        variants.extend(shard_size_variants(args.shard_size_targets, worker_count=args.shard_size_workers))
+        variants.extend(persistence_variants(target_shards=target_shards))
     config = DocxExtractionProfileConfig(
         name=args.name,
         variants=tuple(variants),
@@ -1248,41 +1401,17 @@ def main() -> None:
     )
     write_artifact(prepared, prepared_path)
     run_paths: list[str] = []
-    results: list[DocxExtractionProfileRun] = []
     for variant in config.variants:
         run_path = prefix_join(prefix_join(args.output_path, "runs"), variant.name)
         result = run_extraction_profile(
             run_path,
-            prepared_input_path=prepared_path,
+            input_path=(prepared_path if variant.layout is ProfileLayout.PREPARED else args.fetched_input_path),
             variant=variant,
             maximum_zip_entries=config.maximum_zip_entries,
             maximum_uncompressed_bytes=config.maximum_uncompressed_bytes,
         )
         write_artifact(result, run_path)
         run_paths.append(run_path)
-        results.append(result)
-    if not args.shard_size_targets and args.shard_minutes:
-        calibration = next(
-            (result for result in results if result.variant == "scaling-1"),
-            results[0],
-        )
-        calibration_metrics = derive_run_metrics(_parquet_rows(calibration.metrics_dir))
-        targets = calibrated_shard_targets(
-            total_shard_seconds=calibration_metrics.shard_wall_seconds_total,
-            input_shards=config.preparation_shards,
-            target_minutes=args.shard_minutes,
-        )
-        for variant in shard_size_variants(targets, worker_count=args.shard_size_workers):
-            run_path = prefix_join(prefix_join(args.output_path, "runs"), variant.name)
-            result = run_extraction_profile(
-                run_path,
-                prepared_input_path=prepared_path,
-                variant=variant,
-                maximum_zip_entries=config.maximum_zip_entries,
-                maximum_uncompressed_bytes=config.maximum_uncompressed_bytes,
-            )
-            write_artifact(result, run_path)
-            run_paths.append(run_path)
     report_path = prefix_join(args.output_path, "report")
     report = render_profile_report(report_path, run_paths=tuple(run_paths))
     write_artifact(report, report_path)
