@@ -297,6 +297,7 @@ def _client(session: requests.Session, *, maximum_warc_record_bytes: int = 1 << 
 @pytest.mark.parametrize("compressed", [False, True])
 def test_common_crawl_index_partitions_reads_manifest_and_selects_subset(compressed: bool) -> None:
     manifest = (
+        b"cc-index/table/cc-main/warc/crawl=CC-MAIN-2026-30/\n"
         b"cc-index/table/cc-main/warc/crawl=CC-MAIN-2026-30/subset=crawldiagnostics/part-00000.parquet\n"
         b"cc-index/table/cc-main/warc/crawl=CC-MAIN-2026-30/subset=warc/part-00000.parquet\n"
         b"cc-index/table/cc-main/warc/crawl=CC-MAIN-2026-30/subset=warc/part-00001.parquet\n"
