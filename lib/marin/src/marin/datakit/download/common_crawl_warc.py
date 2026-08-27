@@ -364,13 +364,16 @@ def common_crawl_index_partitions(
 
     manifest = _decode_paths_manifest(encoded_manifest, paths_manifest_url=paths_manifest_url)
     paths = tuple(line.strip() for line in manifest.splitlines() if line.strip())
-    invalid_paths = tuple(path for path in paths if not path.endswith(".parquet") or crawl_id not in path)
+    invalid_paths = tuple(
+        path for path in paths if crawl_id not in path or not (path.endswith(".parquet") or path.endswith("/"))
+    )
     if invalid_paths:
         raise CommonCrawlIndexManifestError(
-            f"Common Crawl index manifest contains paths outside crawl {crawl_id!r} or non-Parquet paths"
+            f"Common Crawl index manifest contains paths outside crawl {crawl_id!r} or invalid entries"
         )
+    file_paths = tuple(path for path in paths if not path.endswith("/"))
     expected_subset_component = f"subset={subset}"
-    partitions = tuple(path for path in paths if expected_subset_component in path.split("/"))
+    partitions = tuple(path for path in file_paths if expected_subset_component in path.split("/"))
     if not partitions:
         raise CommonCrawlIndexManifestError(
             f"Common Crawl index manifest has no partitions for crawl {crawl_id!r}, subset {subset!r}"
