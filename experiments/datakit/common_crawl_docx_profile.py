@@ -78,6 +78,17 @@ class DocxExtractionProfileVariant:
         if self.worker_count <= 0 or self.target_shards <= 0:
             raise ValueError("worker_count and target_shards must be positive")
 
+    @property
+    def hash_attrs(self) -> dict[str, str | int]:
+        """Return the JSON-compatible identity used by Marin step hashing."""
+        return {
+            "name": self.name,
+            "worker_count": self.worker_count,
+            "target_shards": self.target_shards,
+            "role": self.role.value,
+            "lifecycle": self.lifecycle.value,
+        }
+
 
 @dataclass(frozen=True)
 class DocxExtractionProfileConfig:
@@ -1060,7 +1071,7 @@ def common_crawl_docx_profile_steps(
             ),
             deps=[fetched],
             hash_attrs={
-                "variant": variant,
+                "variant": variant.hash_attrs,
                 "maximum_zip_entries": config.maximum_zip_entries,
                 "maximum_uncompressed_bytes": config.maximum_uncompressed_bytes,
                 "schema_version": PROFILE_SCHEMA_VERSION,

@@ -9,14 +9,17 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from docx import Document
+from marin.execution.step_spec import StepSpec
 from zephyr.dataset import ShardInfo
 
 from experiments.datakit.common_crawl_docx_profile import (
     PROFILE_ROW_SCHEMA,
     ConverterLifecycle,
+    DocxExtractionProfileConfig,
     DocxExtractionProfileVariant,
     VariantRole,
     calibrated_shard_targets,
+    common_crawl_docx_profile_steps,
     derive_run_metrics,
     main,
     profile_extraction_shard,
@@ -178,3 +181,30 @@ def test_calibrated_shard_targets_respect_requested_duration_and_input_granulari
     targets = calibrated_shard_targets(total_shard_seconds=3_600, input_shards=20, target_minutes=(1, 5, 30))
 
     assert targets == {"1m": 20, "5m": 12, "30m": 2}
+
+
+def test_profile_steps_resolve_json_serializable_output_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MARIN_PREFIX", str(tmp_path))
+    fetched = StepSpec(name="fetched", fn=lambda output_path: output_path)
+    variants = (
+        DocxExtractionProfileVariant(
+            name="scaling-1",
+            worker_count=1,
+            target_shards=4,
+            role=VariantRole.SCALING,
+        ),
+    )
+
+    runs, report = common_crawl_docx_profile_steps(
+        DocxExtractionProfileConfig(
+            name="smoke",
+            variants=variants,
+            maximum_zip_entries=10_000,
+            maximum_uncompressed_bytes=1 << 20,
+        ),
+        fetched=fetched,
+    )
+
+    assert len(runs) == 1
+    assert runs[0].output_path.startswith(str(tmp_path))
+    assert report.output_path.startswith(str(tmp_path))
