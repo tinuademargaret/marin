@@ -202,7 +202,7 @@ class DoclingDocxExtractor:
 
         try:
             result = _docling_converter().convert(DocumentStream(name="document.docx", stream=io.BytesIO(payload)))
-        except (ConversionError, SecurityError) as error:
+        except (ConversionError, SecurityError, RuntimeError) as error:
             raise DocxExtractionError("Docling failed to extract the DOCX payload") from error
         return extracted_docling_document(result.document)
 
