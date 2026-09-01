@@ -4,6 +4,7 @@
 import io
 import json
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import pytest
@@ -34,8 +35,18 @@ from marin.datakit.download.common_crawl_plan import (
     FetchedCommonCrawlRecord,
 )
 from marin.datakit.download.common_crawl_warc import CommonCrawlWarcRecord, content_digest, main_record_from_index_row
+from PIL import Image
 
 from experiments.datakit.common_crawl_docx_sample import sample_report_markdown
+from experiments.datakit.docx_extraction_methods import (
+    docling_markdown_inline_tables,
+    docling_markdown_inline_tables_without_image_placeholders,
+    docling_markdown_tables_at_end,
+    docling_markdown_tables_at_end_without_image_placeholders,
+    docling_plain_text_inline_tables,
+    docling_plain_text_tables_at_end,
+    docling_without_markdown_markers,
+)
 
 CRAWL_ID = "CC-MAIN-2026-30"
 RECORD_ID = "<urn:uuid:019f8700-d21d-78d8-8eb1-99eaa22579da>"
@@ -68,6 +79,34 @@ def _real_docx_with_table() -> bytes:
     table.cell(0, 1).text = "Revenue"
     table.cell(1, 0).text = "Q1"
     table.cell(1, 1).text = "$42"
+    document.save(output)
+    return output.getvalue()
+
+
+def _real_docx_with_surrounded_table() -> bytes:
+    output = io.BytesIO()
+    document = Document()
+    document.add_heading("Financial results", level=1)
+    document.add_paragraph("Text before the table.")
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Quarter"
+    table.cell(0, 1).text = "Revenue"
+    table.cell(1, 0).text = "Q1"
+    table.cell(1, 1).text = "$42"
+    document.add_paragraph("Text after the table.")
+    document.save(output)
+    return output.getvalue()
+
+
+def _real_docx_with_image() -> bytes:
+    image = io.BytesIO()
+    Image.new("RGB", (2, 2), color="blue").save(image, format="PNG")
+    image.seek(0)
+    output = io.BytesIO()
+    document = Document()
+    document.add_paragraph("Text before the image.")
+    document.add_picture(image)
+    document.add_paragraph("Text after the image.")
     document.save(output)
     return output.getvalue()
 
@@ -124,7 +163,8 @@ def _config(**kwargs: object) -> CommonCrawlDocxConfig:
 @dataclass(frozen=True)
 class _Extractor:
     text: str
-    version: str = "test-extractor-v1"
+    name: str = "test-extractor-v1"
+    identity: str = "test-extractor-v1"
 
     def extract(self, payload: bytes) -> ExtractedDocument:
         assert payload.startswith(b"PK")
@@ -149,7 +189,8 @@ class _LanguageDetector:
 
 @dataclass(frozen=True)
 class _MissingBlocksExtractor:
-    version: str = "missing-blocks-v1"
+    name: str = "missing-blocks-v1"
+    identity: str = "missing-blocks-v1"
 
     def extract(self, payload: bytes) -> ExtractedDocument:
         return ExtractedDocument(text="Extracted text", word_count=2, table_count=0, image_count=0, language_blocks=())
@@ -222,6 +263,69 @@ def test_docling_extractor_preserves_table_text_without_markdown_padding() -> No
     assert "Quarter | Revenue" in extracted.language_blocks[-1].text
 
 
+def test_docling_without_markdown_markers_preserves_content_and_block_alignment() -> None:
+    extracted = docling_without_markdown_markers(
+        _real_docx_payload("A snake_case identifier, 2 * 3, and ~literal~ characters extracted by Docling.")
+    )
+
+    assert "Common Crawl DOCX" in extracted.text
+    assert "snake_case" in extracted.text
+    assert "2 * 3" in extracted.text
+    assert "~literal~" in extracted.text
+    assert "#" not in extracted.text
+    assert extracted.text == "\n\n".join(block.text for block in extracted.language_blocks)
+
+
+@pytest.mark.parametrize(
+    ("extractor", "tables_inline", "heading_prefix"),
+    [
+        (docling_plain_text_inline_tables, True, "Financial results"),
+        (docling_plain_text_tables_at_end, False, "Financial results"),
+        (docling_markdown_inline_tables, True, "## Financial results"),
+        (docling_markdown_tables_at_end, False, "## Financial results"),
+    ],
+)
+def test_factorial_extraction_methods_vary_only_format_and_table_placement(
+    extractor: Callable[[bytes], ExtractedDocument],
+    tables_inline: bool,
+    heading_prefix: str,
+) -> None:
+    extracted = extractor(_real_docx_with_surrounded_table())
+
+    assert extracted.text.startswith(heading_prefix)
+    assert extracted.table_count == 1
+    assert extracted.text == "\n\n".join(block.text for block in extracted.language_blocks)
+    assert [block.is_table for block in extracted.language_blocks] == (
+        [False, True, False] if tables_inline else [False, True]
+    )
+    before = extracted.text.index("Text before the table.")
+    table = extracted.text.index("Quarter")
+    after = extracted.text.index("Text after the table.")
+    assert (before < table < after) if tables_inline else (before < after < table)
+
+
+@pytest.mark.parametrize(
+    ("keep_extractor", "remove_extractor"),
+    [
+        (docling_markdown_inline_tables, docling_markdown_inline_tables_without_image_placeholders),
+        (docling_markdown_tables_at_end, docling_markdown_tables_at_end_without_image_placeholders),
+    ],
+)
+def test_markdown_image_placeholder_treatments_change_only_placeholder_policy(
+    keep_extractor: Callable[[bytes], ExtractedDocument],
+    remove_extractor: Callable[[bytes], ExtractedDocument],
+) -> None:
+    payload = _real_docx_with_image()
+
+    kept = keep_extractor(payload)
+    removed = remove_extractor(payload)
+
+    assert kept.image_count == removed.image_count == 1
+    assert "<!-- image -->" in kept.text
+    assert "<!-- image -->" not in removed.text
+    assert kept.text.replace("\n\n<!-- image -->", "") == removed.text
+
+
 def test_lingua_detector_identifies_multilingual_fixture() -> None:
     french = "Ceci est un document français avec suffisamment de mots pour identifier correctement sa langue. " * 3
 
@@ -248,6 +352,7 @@ def test_extracted_record_preserves_discovery_and_warc_provenance() -> None:
     assert output["selection_reason"] == DocxSelectionReason.DECLARED_MIME.value
     assert "language" not in output
     assert output["table_count"] == 2
+    assert output["extractor"] == "test-extractor-v1"
     assert output["language_blocks"] == [{"start": 0, "stop": 22, "is_table": False}]
 
 
@@ -275,7 +380,7 @@ def test_extracted_record_rejects_missing_language_blocks() -> None:
 def test_pipeline_separates_fetch_extraction_language_and_normalization() -> None:
     discovery, plan, fetch, extraction, language, normalized = common_crawl_docx_steps(
         _config(index_batch_rows=7, max_workers=11),
-        extractor=_Extractor("text", version="extractor-v7"),
+        extractor=_Extractor("text", name="extractor", identity="extractor-v7"),
         language_detector=_LanguageDetector({"en": 1.0}, version="detector-v3"),
     )
 

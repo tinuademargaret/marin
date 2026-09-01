@@ -8,7 +8,7 @@ import re
 import zipfile
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import cache, partial
 from typing import Any, Protocol
@@ -170,7 +170,10 @@ class DocxTextExtractor(Protocol):
     """Text extraction boundary for a validated DOCX payload."""
 
     @property
-    def version(self) -> str: ...
+    def name(self) -> str: ...
+
+    @property
+    def identity(self) -> str: ...
 
     def extract(self, payload: bytes) -> ExtractedDocument: ...
 
@@ -188,7 +191,8 @@ class LanguageDetector(Protocol):
 class DoclingDocxExtractor:
     """Extract DOCX text with Docling while avoiding padded Markdown tables."""
 
-    version: str = EXTRACTOR_VERSION
+    name: str = "docling-default"
+    identity: str = EXTRACTOR_VERSION
 
     def extract(self, payload: bytes) -> ExtractedDocument:
         # Docling is an optional datakit dependency, so importing this module
@@ -419,7 +423,7 @@ def extracted_docx_record(
         "word_count": extracted.word_count,
         "table_count": extracted.table_count,
         "image_count": extracted.image_count,
-        "extractor": extractor.version,
+        "extractor": extractor.identity,
     }
 
 
@@ -719,9 +723,11 @@ def common_crawl_docx_steps(
     *,
     extractor: DocxTextExtractor = DoclingDocxExtractor(),
     language_detector: LanguageDetector = LinguaLanguageDetector(),
+    output_path_prefix: str | None = None,
 ) -> tuple[StepSpec, StepSpec, StepSpec, StepSpec, StepSpec, StepSpec]:
     """Build discovery, planning, fetch, extraction, LID, and normalization steps."""
     slug = config.name.lower()
+    extraction_slug = f"{slug}/{extractor.name}"
     discovery = common_crawl_discovery_step(
         name=f"raw/common-crawl-docx-discovery/{slug}",
         sources=config.sources,
@@ -731,11 +737,13 @@ def common_crawl_docx_steps(
             max_workers=config.max_workers,
         ),
     )
+    discovery = replace(discovery, output_path_prefix=output_path_prefix)
     plan = common_crawl_plan_step(
         name=f"raw/common-crawl-docx-plan/{slug}",
         discovery=discovery,
         options=config.plan,
     )
+    plan = replace(plan, output_path_prefix=output_path_prefix)
     fetch = StepSpec(
         name=f"raw/common-crawl-docx-fetched/{slug}",
         fn=remote(
@@ -749,9 +757,10 @@ def common_crawl_docx_steps(
             "maximum_payload_bytes": config.maximum_payload_bytes,
             "schema_version": 1,
         },
+        output_path_prefix=output_path_prefix,
     )
     extraction = StepSpec(
-        name=f"raw/common-crawl-docx-extracted/{slug}",
+        name=f"raw/common-crawl-docx-extracted/{extraction_slug}",
         fn=remote(
             partial(
                 extract_common_crawl_docx,
@@ -766,12 +775,13 @@ def common_crawl_docx_steps(
         hash_attrs={
             "maximum_zip_entries": config.maximum_zip_entries,
             "maximum_uncompressed_bytes": config.maximum_uncompressed_bytes,
-            "extractor": extractor.version,
+            "extractor": extractor.identity,
             "schema_version": 5,
         },
+        output_path_prefix=output_path_prefix,
     )
     language_identification = StepSpec(
-        name=f"raw/common-crawl-docx-language/{slug}",
+        name=f"raw/common-crawl-docx-language/{extraction_slug}",
         fn=remote(
             partial(
                 identify_common_crawl_docx_language,
@@ -794,15 +804,17 @@ def common_crawl_docx_steps(
             "minimum_score": config.language_minimum_score,
             "schema_version": 3,
         },
+        output_path_prefix=output_path_prefix,
     )
     normalized = normalize_step(
-        name=f"normalized/common-crawl-docx/{slug}",
+        name=f"normalized/common-crawl-docx/{extraction_slug}",
         download=language_identification,
         relative_input_path="data",
         file_extensions=(".parquet",),
         id_field="source_id",
         dedup_mode=DedupMode.EXACT,
         output_schema=COMMON_CRAWL_DOCX_SCHEMA,
+        output_path_prefix=output_path_prefix,
     )
     return discovery, plan, fetch, extraction, language_identification, normalized
 

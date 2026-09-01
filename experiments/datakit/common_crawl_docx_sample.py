@@ -8,6 +8,8 @@ import json
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping
+from dataclasses import replace
+from enum import StrEnum
 from functools import partial
 from statistics import median
 
@@ -18,10 +20,10 @@ from marin.datakit.download.common_crawl_docx import (
     COMMON_CRAWL_DOCX_SCHEMA,
     CommonCrawlDocxConfig,
     CommonCrawlDocxStageResult,
-    DoclingDocxExtractor,
     DocxRecordSelector,
     DocxSelectionReason,
     LinguaLanguageDetector,
+    common_crawl_docx_steps,
     evenly_spaced_sample,
     extract_common_crawl_docx,
     fetch_common_crawl_docx,
@@ -49,9 +51,30 @@ from zephyr import counters
 from zephyr.dataset import Dataset
 from zephyr.execution import ZephyrContext
 
+from experiments.datakit.docx_extraction_methods import (
+    DOCX_EXTRACTION_METHODS,
+    ExtractionMethod,
+    extraction_methods,
+)
+
 DEFAULT_INDEX_PARTITIONS = 6
 DEFAULT_CANDIDATES_PER_REASON_PER_PARTITION = 10
 DEFAULT_EXAMPLES_PER_REASON = 3
+
+
+class SampleTerminalStage(StrEnum):
+    """Last sample-pipeline stage to materialize."""
+
+    FETCHED = "fetched"
+    NORMALIZED = "normalized"
+    REPORT = "report"
+
+
+class DiscoveryScope(StrEnum):
+    """Amount of the Common Crawl snapshot to discover."""
+
+    SAMPLE = "sample"
+    FULL = "full"
 
 
 class CommonCrawlDocxSampleReport(BaseModel):
@@ -312,9 +335,11 @@ def write_sample_report(
 def common_crawl_docx_sample_steps(
     config: CommonCrawlDocxConfig,
     *,
+    extraction_method: ExtractionMethod,
     index_partitions: int = DEFAULT_INDEX_PARTITIONS,
     candidates_per_reason: int = DEFAULT_CANDIDATES_PER_REASON_PER_PARTITION,
     examples_per_reason: int = DEFAULT_EXAMPLES_PER_REASON,
+    output_path_prefix: str | None = None,
 ) -> tuple[StepSpec, StepSpec, StepSpec, StepSpec, StepSpec, StepSpec, StepSpec]:
     """Build the sample discovery, fetch, extraction, LID, normalization, and report DAG."""
     if candidates_per_reason <= 0 or examples_per_reason <= 0:
@@ -323,6 +348,7 @@ def common_crawl_docx_sample_steps(
         raise ValueError("The bounded sample pipeline requires exactly one Common Crawl source")
     source = config.sources[0]
     slug = config.name.lower()
+    method_slug = f"{slug}/{extraction_method.name}"
     discovery = StepSpec(
         name=f"samples/common-crawl-docx/{slug}/candidates",
         fn=remote(
@@ -346,12 +372,13 @@ def common_crawl_docx_sample_steps(
             "schema_version": 2,
         },
     )
+    discovery = replace(discovery, output_path_prefix=output_path_prefix)
     plan = common_crawl_plan_step(
         name=f"samples/common-crawl-docx/{slug}/plan",
         discovery=discovery,
         options=config.plan,
     )
-    extractor = DoclingDocxExtractor()
+    plan = replace(plan, output_path_prefix=output_path_prefix)
     detector = LinguaLanguageDetector()
     fetch = StepSpec(
         name=f"samples/common-crawl-docx/{slug}/fetched",
@@ -366,15 +393,16 @@ def common_crawl_docx_sample_steps(
             "maximum_payload_bytes": config.maximum_payload_bytes,
             "schema_version": 1,
         },
+        output_path_prefix=output_path_prefix,
     )
     extraction = StepSpec(
-        name=f"samples/common-crawl-docx/{slug}/extracted",
+        name=f"samples/common-crawl-docx/{method_slug}/extracted",
         fn=remote(
             partial(
                 extract_common_crawl_docx,
                 fetched_input_path=fetch.output_path,
                 config=config,
-                extractor=extractor,
+                extractor=extraction_method,
             ),
             resources=ResourceConfig(cpu=1, ram="4g"),
             pip_dependency_groups=["datakit"],
@@ -383,12 +411,13 @@ def common_crawl_docx_sample_steps(
         hash_attrs={
             "maximum_zip_entries": config.maximum_zip_entries,
             "maximum_uncompressed_bytes": config.maximum_uncompressed_bytes,
-            "extractor": extractor.version,
+            "extractor": extraction_method.identity,
             "schema_version": 5,
         },
+        output_path_prefix=output_path_prefix,
     )
     language = StepSpec(
-        name=f"samples/common-crawl-docx/{slug}/language",
+        name=f"samples/common-crawl-docx/{method_slug}/language",
         fn=remote(
             partial(
                 identify_common_crawl_docx_language,
@@ -411,18 +440,20 @@ def common_crawl_docx_sample_steps(
             "minimum_score": config.language_minimum_score,
             "schema_version": 3,
         },
+        output_path_prefix=output_path_prefix,
     )
     normalized = normalize_step(
-        name=f"samples/common-crawl-docx/{slug}/normalized",
+        name=f"samples/common-crawl-docx/{method_slug}/normalized",
         download=language,
         relative_input_path="data",
         file_extensions=(".parquet",),
         id_field="source_id",
         dedup_mode=DedupMode.EXACT,
         output_schema=COMMON_CRAWL_DOCX_SCHEMA,
+        output_path_prefix=output_path_prefix,
     )
     report = StepSpec(
-        name=f"samples/common-crawl-docx/{slug}/report",
+        name=f"samples/common-crawl-docx/{method_slug}/report",
         fn=partial(
             write_sample_report,
             source=source,
@@ -437,7 +468,12 @@ def common_crawl_docx_sample_steps(
             examples_per_reason=examples_per_reason,
         ),
         deps=[discovery, fetch, extraction, language, normalized],
-        hash_attrs={"examples_per_reason": examples_per_reason, "report_version": 2},
+        hash_attrs={
+            "extraction_method": extraction_method.name,
+            "examples_per_reason": examples_per_reason,
+            "report_version": 2,
+        },
+        output_path_prefix=output_path_prefix,
     )
     return discovery, plan, fetch, extraction, language, normalized, report
 
@@ -454,6 +490,31 @@ def main() -> None:
     )
     parser.add_argument("--examples-per-reason", type=int, default=DEFAULT_EXAMPLES_PER_REASON)
     parser.add_argument("--max-workers", type=int, default=24)
+    parser.add_argument(
+        "--extraction-method",
+        action="append",
+        choices=sorted(DOCX_EXTRACTION_METHODS),
+        dest="extraction_methods",
+        help="Extraction treatment to run; repeat for an A/B comparison. Defaults to docling-default.",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        help="Storage prefix for every stage, for example gs://my-bucket/docx-experiments/run-1.",
+    )
+    parser.add_argument(
+        "--run-through",
+        type=SampleTerminalStage,
+        choices=tuple(SampleTerminalStage),
+        default=SampleTerminalStage.REPORT,
+        help="Last stage to materialize. Use fetched once, then normalized or report for extraction treatments.",
+    )
+    parser.add_argument(
+        "--discovery-scope",
+        type=DiscoveryScope,
+        choices=tuple(DiscoveryScope),
+        default=DiscoveryScope.SAMPLE,
+        help="Use sample for bounded smoke tests or full to scan every index partition in the snapshot.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -469,17 +530,50 @@ def main() -> None:
         ),
         max_workers=args.max_workers,
     )
-    steps = common_crawl_docx_sample_steps(
-        config,
-        index_partitions=args.index_partitions,
-        candidates_per_reason=args.candidates_per_reason_per_partition,
-        examples_per_reason=args.examples_per_reason,
-    )
-    StepRunner().run([steps[-1]], dry_run=args.dry_run, max_concurrent=1)
-    if not args.dry_run:
-        report = read_artifact(steps[-1].output_path, CommonCrawlDocxSampleReport)
-        print(f"Markdown report: {report.markdown_path}")
-        print(f"Review examples: {report.examples_path}")
+    methods = extraction_methods(args.extraction_methods or ("docling-default",))
+    if args.discovery_scope is DiscoveryScope.FULL:
+        if args.run_through is SampleTerminalStage.REPORT:
+            parser.error("--run-through report is unavailable for full discovery; use fetched or normalized")
+        runs = tuple(
+            common_crawl_docx_steps(
+                config,
+                extractor=method,
+                output_path_prefix=args.output_prefix,
+            )
+            for method in methods
+        )
+    else:
+        runs = tuple(
+            common_crawl_docx_sample_steps(
+                config,
+                extraction_method=method,
+                index_partitions=args.index_partitions,
+                candidates_per_reason=args.candidates_per_reason_per_partition,
+                examples_per_reason=args.examples_per_reason,
+                output_path_prefix=args.output_prefix,
+            )
+            for method in methods
+        )
+    if args.run_through is SampleTerminalStage.FETCHED:
+        terminals = [runs[0][2]]
+    elif args.run_through is SampleTerminalStage.NORMALIZED:
+        terminals = [steps[5] for steps in runs]
+    elif args.discovery_scope is DiscoveryScope.SAMPLE:
+        terminals = [steps[6] for steps in runs]
+    else:
+        raise ValueError("Full discovery does not have a report stage")
+    StepRunner().run(terminals, dry_run=args.dry_run, max_concurrent=1)
+    if not args.dry_run and args.run_through is not SampleTerminalStage.FETCHED:
+        for method, steps in zip(methods, runs, strict=True):
+            normalized = read_artifact(steps[5].output_path, NormalizedData)
+            print(f"{method.name} normalized data: {normalized.main_output_dir}")
+            if args.run_through is SampleTerminalStage.REPORT:
+                report = read_artifact(steps[6].output_path, CommonCrawlDocxSampleReport)
+                print(f"{method.name} Markdown report: {report.markdown_path}")
+                print(f"{method.name} review examples: {report.examples_path}")
+    elif not args.dry_run:
+        fetched = read_artifact(runs[0][2].output_path, CommonCrawlDocxStageResult)
+        print(f"Fetched DOCX data: {fetched.data_dir}")
 
 
 if __name__ == "__main__":

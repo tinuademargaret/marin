@@ -117,8 +117,10 @@ def train_lm(
     mp: str = MARIN_PRECISION,
     tensor_parallel_size: int = 1,
     steps_per_eval: int = 1000,
+    wandb_entity: str | None = None,
     wandb_project: str = "marin",
     wandb_group: str | None = None,
+    wandb_mode: str | None = None,
     run_id: str | None = None,
     tags: Sequence[str] = (),
     env_vars: dict[str, str] | None = None,
@@ -198,10 +200,12 @@ def train_lm(
             trainer=TrainerConfig(
                 id=run_id,
                 tracker=WandbConfig(
+                    entity=wandb_entity,
                     project=wandb_project,
                     name=run_id,
                     tags=[*tags],
                     group=wandb_group,
+                    mode=wandb_mode,
                     # Mirror metrics next to the run's output so they outlive the job.
                     replicate_path=ctx.output_path,
                 ),
