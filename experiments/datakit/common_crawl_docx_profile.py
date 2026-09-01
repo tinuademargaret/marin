@@ -6,7 +6,6 @@
 import argparse
 import json
 import math
-import threading
 import time
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
@@ -47,7 +46,6 @@ DEFAULT_WORKER_COUNTS = (1, 2, 4, 8, 16)
 DEFAULT_PREPARATION_SHARDS = 128
 _MEBIBYTE = 1 << 20
 _PERSISTENT_CONVERTER_RUNS: set[str] = set()
-_PERSISTENT_CONVERTER_LOCK = threading.Lock()
 
 
 class ConverterLifecycle(StrEnum):
@@ -104,6 +102,8 @@ class DocxExtractionProfileVariant:
             raise ValueError("natural-layout variants must not set target_shards")
         if self.lifecycle is ConverterLifecycle.PER_WORKER and self.runner is not RunnerMode.INLINE:
             raise ValueError("a persistent worker converter requires the inline runner")
+        if self.lifecycle is ConverterLifecycle.PER_WORKER and self.worker_count != 1:
+            raise ValueError("a persistent worker converter requires exactly one worker")
 
     @property
     def hash_attrs(self) -> dict[str, str | int | None]:
@@ -446,13 +446,12 @@ def _initialize_extractor(extractor: DoclingDocxExtractor) -> tuple[float, float
 
 
 def _initialize_persistent_extractor(run_token: str, extractor: DoclingDocxExtractor) -> tuple[float, float, int]:
-    with _PERSISTENT_CONVERTER_LOCK:
-        if run_token in _PERSISTENT_CONVERTER_RUNS:
-            return 0.0, 0.0, 0
-        reset_docling_converter()
-        wall_seconds, cpu_seconds = _initialize_extractor(extractor)
-        _PERSISTENT_CONVERTER_RUNS.add(run_token)
-        return wall_seconds, cpu_seconds, 1
+    if run_token in _PERSISTENT_CONVERTER_RUNS:
+        return 0.0, 0.0, 0
+    reset_docling_converter()
+    wall_seconds, cpu_seconds = _initialize_extractor(extractor)
+    _PERSISTENT_CONVERTER_RUNS.add(run_token)
+    return wall_seconds, cpu_seconds, 1
 
 
 def _profile_row(

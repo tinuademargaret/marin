@@ -4,8 +4,10 @@
 import io
 import json
 import sys
+from functools import partial
 from pathlib import Path
 
+import cloudpickle
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -169,6 +171,31 @@ def test_profile_extraction_shard_reuses_persistent_process_converter(tmp_path: 
         assert second[-1]["converter_initializations"] == 0
     finally:
         reset_docling_converter()
+
+
+def test_profile_extraction_shard_serializes_when_script_module_is_pickled_by_value() -> None:
+    module = sys.modules[profile_extraction_shard.__module__]
+    variant = DocxExtractionProfileVariant(
+        name="scaling-1",
+        worker_count=1,
+        target_shards=32,
+        role=VariantRole.SCALING,
+    )
+    shard_function = partial(
+        profile_extraction_shard,
+        run_token="profile-run",
+        variant=variant,
+        maximum_zip_entries=10_000,
+        maximum_uncompressed_bytes=1 << 30,
+    )
+
+    cloudpickle.register_pickle_by_value(module)
+    try:
+        serialized = cloudpickle.dumps(shard_function)
+    finally:
+        cloudpickle.unregister_pickle_by_value(module)
+
+    assert cloudpickle.loads(serialized).keywords["variant"] == variant
 
 
 def test_derive_run_metrics_calculates_tail_utilization_and_terminal_idle() -> None:
