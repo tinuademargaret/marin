@@ -133,8 +133,7 @@ def build(
             tags=("docx", "extraction-ablation", variant.name, model_size),
         )
         evaluation_groups = tuple(
-            replace(group, discover_latest_checkpoint=False)
-            for group in core_evals(accelerator=evaluation_accelerator)
+            replace(group, discover_latest_checkpoint=False) for group in core_evals(accelerator=evaluation_accelerator)
         )
         results = eval_steps(checkpoint, evaluation_groups)
         reports[variant.name] = eval_report(
