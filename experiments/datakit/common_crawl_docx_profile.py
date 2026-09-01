@@ -34,7 +34,7 @@ from marin.datakit.download.common_crawl_docx import (
 from marin.execution.artifact import read_artifact, write_artifact
 from marin.execution.remote import remote
 from marin.execution.step_spec import StepSpec
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from rigging.filesystem import prefix_join, url_to_fs
 from zephyr import counters
 from zephyr.dataset import Dataset, ShardInfo
@@ -386,7 +386,12 @@ def profile_extraction_shard(
                 )
                 extracted_bytes = len(extracted.text.encode("utf-8"))
                 documents_succeeded += 1
-            except (InvalidDocxError, EmptyDocxTextError, DocxExtractionError) as error:
+            except (
+                InvalidDocxError,
+                EmptyDocxTextError,
+                DocxExtractionError,
+                ValidationError,
+            ) as error:
                 success = False
                 error_kind = type(error).__name__
             conversion_wall = time.perf_counter() - conversion_wall_start
