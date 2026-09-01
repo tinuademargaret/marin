@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import pytest
 from docx import Document
+from marin.datakit.download import common_crawl_docx
 from marin.datakit.download.common_crawl_docx import (
     DOCX_MIME_TYPE,
     CommonCrawlDocxConfig,
@@ -260,6 +261,17 @@ def test_document_local_extraction_failure_is_skipped() -> None:
     )
 
     assert output is None
+
+
+def test_docling_runtime_failure_uses_extraction_error_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RuntimeFailingConverter:
+        def convert(self, _document: object) -> None:
+            raise RuntimeError("Pipeline SimplePipeline failed")
+
+    monkeypatch.setattr(common_crawl_docx, "_docling_converter", RuntimeFailingConverter)
+
+    with pytest.raises(DocxExtractionError):
+        DoclingDocxExtractor().extract(_docx_payload())
 
 
 def test_extracted_record_rejects_missing_language_blocks() -> None:
