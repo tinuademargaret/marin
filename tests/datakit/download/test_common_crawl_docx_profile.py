@@ -198,18 +198,18 @@ def test_profile_extraction_shard_serializes_when_script_module_is_pickled_by_va
     assert cloudpickle.loads(serialized).keywords["variant"] == variant
 
 
-def test_derive_run_metrics_calculates_tail_utilization_and_terminal_idle() -> None:
+def test_derive_run_metrics_distinguishes_final_tail_idle_from_whole_run_idle() -> None:
     documents = [
         {
             "row_kind": "document",
             "variant": "scaling-2",
             "variant_role": VariantRole.SCALING.value,
             "worker_count": 2,
-            "target_shards": 2,
+            "target_shards": 4,
             "layout": ProfileLayout.PREPARED.value,
             "lifecycle": ConverterLifecycle.PER_SHARD.value,
             "runner": RunnerMode.SUBPROCESS.value,
-            "shard_idx": index % 2,
+            "shard_idx": index % 4,
             "success": index >= 3,
             "error_kind": "InvalidDocxError" if index < 2 else ("DocxExtractionError" if index == 2 else None),
             "payload_bytes": 100,
@@ -219,67 +219,51 @@ def test_derive_run_metrics_calculates_tail_utilization_and_terminal_idle() -> N
         }
         for index in range(100)
     ]
+    shard_intervals = ((0.0, 100.0), (0.0, 80.0), (80.0, 140.0), (100.0, 150.0))
     shards = [
         {
             "row_kind": "shard",
             "variant": "scaling-2",
             "variant_role": VariantRole.SCALING.value,
             "worker_count": 2,
-            "target_shards": 2,
+            "target_shards": 4,
             "layout": ProfileLayout.PREPARED.value,
             "lifecycle": ConverterLifecycle.PER_SHARD.value,
             "runner": RunnerMode.SUBPROCESS.value,
-            "shard_idx": 0,
+            "shard_idx": shard_idx,
             "converter_initialization_wall_seconds": 1.0,
             "converter_initialization_cpu_seconds": 0.5,
             "converter_initializations": 1,
             "read_wall_seconds": 1.0,
-            "shard_wall_seconds": 150.0,
+            "shard_wall_seconds": finished_at - started_at,
             "shard_cpu_seconds": 9.0,
-            "peak_rss_bytes": 1_000,
+            "peak_rss_bytes": 1_000 + shard_idx * 1_000,
             "peak_cpu_percent": 100.0,
-            "initial_rss_bytes": 500,
-            "final_rss_bytes": 750,
-            "started_at": 0.0,
-            "finished_at": 150.0,
-        },
-        {
-            "row_kind": "shard",
-            "variant": "scaling-2",
-            "variant_role": VariantRole.SCALING.value,
-            "worker_count": 2,
-            "target_shards": 2,
-            "layout": ProfileLayout.PREPARED.value,
-            "lifecycle": ConverterLifecycle.PER_SHARD.value,
-            "runner": RunnerMode.SUBPROCESS.value,
-            "shard_idx": 1,
-            "converter_initialization_wall_seconds": 1.0,
-            "converter_initialization_cpu_seconds": 0.5,
-            "converter_initializations": 1,
-            "read_wall_seconds": 1.0,
-            "shard_wall_seconds": 75.0,
-            "shard_cpu_seconds": 4.0,
-            "peak_rss_bytes": 2_000,
-            "peak_cpu_percent": 90.0,
-            "initial_rss_bytes": 1_000,
-            "final_rss_bytes": 1_500,
-            "started_at": 0.0,
-            "finished_at": 75.0,
-        },
+            "initial_rss_bytes": 500 + shard_idx * 500,
+            "final_rss_bytes": 750 + shard_idx * 500,
+            "started_at": started_at,
+            "finished_at": finished_at,
+        }
+        for shard_idx, (started_at, finished_at) in enumerate(shard_intervals)
     ]
 
     metrics = derive_run_metrics([*documents, *shards])
 
     assert metrics.top_one_percent_work_share == pytest.approx(100 / 199)
-    assert metrics.worker_utilization == pytest.approx(0.75)
-    assert metrics.terminal_idle_fraction == pytest.approx(0.25)
+    assert metrics.worker_utilization == pytest.approx(290 / 300)
+    assert metrics.whole_run_idle_fraction == pytest.approx(10 / 300)
+    assert metrics.final_tail_duration_seconds == pytest.approx(50)
+    assert metrics.final_tail_idle_worker_seconds == pytest.approx(10)
+    assert metrics.final_tail_idle_fraction == pytest.approx(10 / 100)
+    assert metrics.final_tail_idle_full_run_fraction == pytest.approx(10 / 300)
+    assert metrics.final_tail_active_shards == {2: 40.0, 3: 50.0}
     assert metrics.peak_concurrency == 2
-    assert metrics.documents_per_initialization == 50
-    assert metrics.peak_rss_bytes == 2_000
+    assert metrics.documents_per_initialization == 25
+    assert metrics.peak_rss_bytes == 4_000
     assert metrics.failures == 3
     assert metrics.failure_distribution == {"DocxExtractionError": 1, "InvalidDocxError": 2}
-    assert metrics.other_wall_seconds == pytest.approx(22.0)
-    assert metrics.other_fraction == pytest.approx(22 / 225)
+    assert metrics.other_wall_seconds == pytest.approx(83.0)
+    assert metrics.other_fraction == pytest.approx(83 / 290)
     summary = profile_summary([metrics])
     assert summary["scaling"] == []
     runs = summary["runs"]
@@ -290,7 +274,7 @@ def test_derive_run_metrics_calculates_tail_utilization_and_terminal_idle() -> N
         "DocxExtractionError": 1,
         "InvalidDocxError": 2,
     }
-    assert run["other_wall_seconds"] == pytest.approx(22.0)
+    assert run["other_wall_seconds"] == pytest.approx(83.0)
 
 
 def test_profile_cli_dry_run_builds_fixed_corpus_variants(

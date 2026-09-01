@@ -560,7 +560,12 @@ class RunMetrics:
     maximum_document_share: float
     maximum_document_share_percentiles: Mapping[str, float]
     worker_utilization: float
-    terminal_idle_fraction: float
+    whole_run_idle_fraction: float
+    final_tail_duration_seconds: float
+    final_tail_idle_worker_seconds: float
+    final_tail_idle_fraction: float
+    final_tail_idle_full_run_fraction: float
+    final_tail_active_shards: Mapping[int, float]
     read_fraction: float
     conversion_fraction: float
     other_fraction: float
@@ -569,6 +574,15 @@ class RunMetrics:
 
     def as_dict(self) -> dict[str, object]:
         return dict(self.__dict__)
+
+
+@dataclass(frozen=True)
+class _FinalTailMetrics:
+    duration_seconds: float
+    idle_worker_seconds: float
+    idle_fraction: float
+    idle_full_run_fraction: float
+    active_shards: Mapping[int, float]
 
 
 def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
@@ -594,6 +608,7 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
     other_total = max(0.0, other_total)
     initializations = sum(int(row["converter_initializations"]) for row in shards)
     table = _per_shard_maximum_document_share(documents)
+    final_tail = _final_tail_metrics(shards, starts, finishes, peak_concurrency, stage_wall)
     failure_distribution = Counter(
         str(row["error_kind"] or "UnknownError") for row in documents if not bool(row["success"])
     )
@@ -640,7 +655,15 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
         maximum_document_share=max(table.values(), default=0.0),
         maximum_document_share_percentiles=_percentiles(np.asarray(list(table.values())), (50, 95, 99, 100)),
         worker_utilization=_divide(float(shard_times.sum()), peak_concurrency * stage_wall),
-        terminal_idle_fraction=_terminal_slot_idle_fraction(starts, finishes, peak_concurrency),
+        whole_run_idle_fraction=max(
+            0.0,
+            1 - _divide(float(shard_times.sum()), peak_concurrency * stage_wall),
+        ),
+        final_tail_duration_seconds=final_tail.duration_seconds,
+        final_tail_idle_worker_seconds=final_tail.idle_worker_seconds,
+        final_tail_idle_fraction=final_tail.idle_fraction,
+        final_tail_idle_full_run_fraction=final_tail.idle_full_run_fraction,
+        final_tail_active_shards=final_tail.active_shards,
         read_fraction=_divide(read_total, shard_wall_total),
         conversion_fraction=_divide(conversion_total, shard_wall_total),
         other_fraction=_divide(other_total, shard_wall_total),
@@ -665,16 +688,35 @@ def _percentiles(values: np.ndarray, percentiles: Sequence[float]) -> dict[str, 
     return {f"p{percentile:g}": float(np.percentile(values, percentile)) for percentile in percentiles}
 
 
-def _terminal_slot_idle_fraction(starts: np.ndarray, finishes: np.ndarray, slot_count: int) -> float:
-    """Measure unused concurrency after the final queued shard has started."""
+def _final_tail_metrics(
+    shards: Sequence[Mapping[str, object]],
+    starts: np.ndarray,
+    finishes: np.ndarray,
+    slot_count: int,
+    stage_wall_seconds: float,
+) -> _FinalTailMetrics:
+    """Measure capacity after the final queued shard has started."""
     terminal_start = float(starts.max())
     stage_finish = float(finishes.max())
-    terminal_capacity = slot_count * (stage_finish - terminal_start)
+    terminal_duration = stage_finish - terminal_start
+    terminal_capacity = slot_count * terminal_duration
     terminal_busy = sum(
         max(0.0, float(finish) - max(float(start), terminal_start))
         for start, finish in zip(starts, finishes, strict=True)
     )
-    return _divide(terminal_capacity - terminal_busy, terminal_capacity)
+    terminal_idle = max(0.0, terminal_capacity - terminal_busy)
+    active_shards = {
+        int(shard["shard_idx"]): float(finish) - terminal_start
+        for shard, start, finish in zip(shards, starts, finishes, strict=True)
+        if float(start) <= terminal_start < float(finish)
+    }
+    return _FinalTailMetrics(
+        duration_seconds=terminal_duration,
+        idle_worker_seconds=terminal_idle,
+        idle_fraction=_divide(terminal_idle, terminal_capacity),
+        idle_full_run_fraction=_divide(terminal_idle, slot_count * stage_wall_seconds),
+        active_shards=dict(sorted(active_shards.items())),
+    )
 
 
 def _observed_peak_concurrency(starts: np.ndarray, finishes: np.ndarray) -> int:
@@ -703,9 +745,9 @@ def profile_decisions(metrics: RunMetrics) -> list[tuple[str, str, str]]:
         )
     )
     idle_decision: tuple[str, str] = (
-        ("insufficient", "Peak concurrency was one; terminal idle cannot measure worker imbalance.")
+        ("insufficient", "Peak concurrency was one; final-tail idle cannot measure worker imbalance.")
         if metrics.peak_concurrency < 2
-        else (_idle_rating(metrics.terminal_idle_fraction), _idle_action(metrics))
+        else (_idle_rating(metrics.final_tail_idle_full_run_fraction), _idle_action(metrics))
     )
     return [
         (
@@ -715,7 +757,7 @@ def profile_decisions(metrics: RunMetrics) -> list[tuple[str, str, str]]:
         ),
         ("Document tail", _tail_rating(metrics.top_one_percent_work_share), _tail_action(metrics)),
         ("Shard balance", shard_decision[0], shard_decision[1]),
-        ("Terminal idle", idle_decision[0], idle_decision[1]),
+        ("Final-tail capacity", idle_decision[0], idle_decision[1]),
         ("I/O versus conversion", "context", _service_action(metrics)),
     ]
 
@@ -748,8 +790,9 @@ def _idle_rating(fraction: float) -> str:
 
 def _idle_action(metrics: RunMetrics) -> str:
     return (
-        f"Estimated terminal idle fraction is {metrics.terminal_idle_fraction:.1%}; "
-        f"aggregate utilization is {metrics.worker_utilization:.1%}."
+        f"Final-tail idle is {metrics.final_tail_idle_full_run_fraction:.1%} of full-run capacity "
+        f"({metrics.final_tail_idle_fraction:.1%} within the final tail); "
+        f"whole-run idle is {metrics.whole_run_idle_fraction:.1%}."
     )
 
 
@@ -877,7 +920,7 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
         "## Run overview",
         "",
         "| Run | Layout | Runner | Requested workers | Peak concurrency | Target/observed shards | Documents | "
-        "Wall time | Docs/s | Init/wall | Read | Conversion | Other | Utilization | Terminal idle |",
+        "Wall time | Docs/s | Init/wall | Read | Conversion | Other | Utilization | Whole-run idle |",
         "| " + " | ".join(("---", "---", "---", *("---:",) * 12)) + " |",
     ]
     for metric in metrics:
@@ -888,8 +931,42 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
             f"{_duration(metric.stage_wall_seconds)} | {_divide(metric.documents, metric.stage_wall_seconds):.2f} | "
             f"{_divide(metric.initialization_wall_seconds, metric.shard_wall_seconds_total):.1%} | "
             f"{metric.read_fraction:.1%} | {metric.conversion_fraction:.1%} | {metric.other_fraction:.1%} | "
-            f"{metric.worker_utilization:.1%} | {metric.terminal_idle_fraction:.1%} |"
+            f"{metric.worker_utilization:.1%} | {metric.whole_run_idle_fraction:.1%} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Final-tail capacity",
+            "",
+            "The final tail begins when the last queued shard starts. `Idle within final tail` uses only that "
+            "tail as its denominator; `Tail idle/full-run capacity` divides the same idle worker-time by all "
+            "worker capacity available during the run.",
+            "",
+            "| Run | Tail duration | Tail idle worker-time | Idle within final tail | "
+            "Tail idle/full-run capacity | Whole-run idle |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for metric in metrics:
+        lines.append(
+            f"| `{metric.variant}` | {_duration(metric.final_tail_duration_seconds)} | "
+            f"{_duration(metric.final_tail_idle_worker_seconds)} | {metric.final_tail_idle_fraction:.1%} | "
+            f"{metric.final_tail_idle_full_run_fraction:.1%} | {metric.whole_run_idle_fraction:.1%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### Shards active at final-tail start",
+            "",
+            "Remaining time is measured from the start of the final tail until that shard finishes.",
+            "",
+            "| Run | Shard | Remaining time |",
+            "| --- | ---: | ---: |",
+        ]
+    )
+    for metric in metrics:
+        for shard_idx, remaining_seconds in metric.final_tail_active_shards.items():
+            lines.append(f"| `{metric.variant}` | {shard_idx} | {_duration(remaining_seconds)} |")
     lines.extend(
         [
             "",
@@ -1042,8 +1119,9 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
             "",
             "- Read time includes Parquet access and decoding. Conversion time includes DOCX validation and "
             "Docling conversion.",
-            "- Worker utilization and terminal idle are derived from the measured concurrency timeline. Terminal idle "
-            "starts when the final queued shard begins; task-process PIDs are not treated as workers.",
+            "- Worker utilization, whole-run idle, and final-tail capacity are derived from the measured concurrency "
+            "timeline. The final tail starts when the final queued shard begins; task-process PIDs are not treated "
+            "as workers.",
             "- Cross-worker stage wall time uses wall clocks and can contain small clock-skew error.",
             "- Peak CPU is sampled at document boundaries; use Zephyr finelog CPU time as the primary A/B cost signal.",
             "- Task retries are not present in successful output rows; obtain them from coordinator logs and "
