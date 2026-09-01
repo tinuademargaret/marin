@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import io
+import json
 import sys
 from pathlib import Path
 
@@ -182,7 +183,8 @@ def test_derive_run_metrics_calculates_tail_utilization_and_terminal_idle() -> N
             "lifecycle": ConverterLifecycle.PER_SHARD.value,
             "runner": RunnerMode.SUBPROCESS.value,
             "shard_idx": index % 2,
-            "success": True,
+            "success": index >= 3,
+            "error_kind": "InvalidDocxError" if index < 2 else ("DocxExtractionError" if index == 2 else None),
             "payload_bytes": 100,
             "extracted_bytes": 50,
             "conversion_wall_seconds": 100.0 if index == 99 else 1.0,
@@ -205,14 +207,14 @@ def test_derive_run_metrics_calculates_tail_utilization_and_terminal_idle() -> N
             "converter_initialization_cpu_seconds": 0.5,
             "converter_initializations": 1,
             "read_wall_seconds": 1.0,
-            "shard_wall_seconds": 10.0,
+            "shard_wall_seconds": 150.0,
             "shard_cpu_seconds": 9.0,
             "peak_rss_bytes": 1_000,
             "peak_cpu_percent": 100.0,
             "initial_rss_bytes": 500,
             "final_rss_bytes": 750,
             "started_at": 0.0,
-            "finished_at": 10.0,
+            "finished_at": 150.0,
         },
         {
             "row_kind": "shard",
@@ -228,14 +230,14 @@ def test_derive_run_metrics_calculates_tail_utilization_and_terminal_idle() -> N
             "converter_initialization_cpu_seconds": 0.5,
             "converter_initializations": 1,
             "read_wall_seconds": 1.0,
-            "shard_wall_seconds": 5.0,
+            "shard_wall_seconds": 75.0,
             "shard_cpu_seconds": 4.0,
             "peak_rss_bytes": 2_000,
             "peak_cpu_percent": 90.0,
             "initial_rss_bytes": 1_000,
             "final_rss_bytes": 1_500,
             "started_at": 0.0,
-            "finished_at": 5.0,
+            "finished_at": 75.0,
         },
     ]
 
@@ -247,7 +249,21 @@ def test_derive_run_metrics_calculates_tail_utilization_and_terminal_idle() -> N
     assert metrics.peak_concurrency == 2
     assert metrics.documents_per_initialization == 50
     assert metrics.peak_rss_bytes == 2_000
-    assert profile_summary([metrics])["scaling"] == []
+    assert metrics.failures == 3
+    assert metrics.failure_distribution == {"DocxExtractionError": 1, "InvalidDocxError": 2}
+    assert metrics.other_wall_seconds == pytest.approx(22.0)
+    assert metrics.other_fraction == pytest.approx(22 / 225)
+    summary = profile_summary([metrics])
+    assert summary["scaling"] == []
+    runs = summary["runs"]
+    assert isinstance(runs, list)
+    run = runs[0]
+    assert isinstance(run, dict)
+    assert run["failure_distribution"] == {
+        "DocxExtractionError": 1,
+        "InvalidDocxError": 2,
+    }
+    assert run["other_wall_seconds"] == pytest.approx(22.0)
 
 
 def test_profile_cli_dry_run_builds_fixed_corpus_variants(
@@ -278,6 +294,43 @@ def test_profile_cli_dry_run_builds_fixed_corpus_variants(
     assert '"name": "scaling-16"' in output
     assert '"name": "persistence-worker"' in output
     assert '"name": "natural-16"' in output
+
+
+def test_profile_cli_can_select_only_prepared_scaling_variants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fetched_path = tmp_path / "fetched"
+    data_path = fetched_path / "data"
+    data_path.mkdir(parents=True)
+    (data_path / "part-00000.parquet").touch()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "common_crawl_docx_profile",
+            "--fetched-input-path",
+            str(fetched_path),
+            "--output-path",
+            str(tmp_path / "profile"),
+            "--worker-counts",
+            "1,4",
+            "--target-shards",
+            "32",
+            "--shard-counts",
+            "32",
+            "--skip-natural-layout",
+            "--skip-persistence",
+            "--dry-run",
+        ],
+    )
+
+    main()
+
+    variants = json.loads(capsys.readouterr().out)
+    assert [(variant["name"], variant["target_shards"]) for variant in variants] == [
+        ("scaling-1", 32),
+        ("scaling-4", 32),
+    ]
 
 
 def test_profile_summary_selects_smallest_shard_meeting_initialization_target() -> None:

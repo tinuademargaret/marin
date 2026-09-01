@@ -8,6 +8,7 @@ import json
 import math
 import threading
 import time
+from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -536,6 +537,7 @@ class RunMetrics:
     runner: str
     documents: int
     failures: int
+    failure_distribution: Mapping[str, int]
     payload_bytes: int
     extracted_bytes: int
     stage_wall_seconds: float
@@ -544,6 +546,7 @@ class RunMetrics:
     initialization_wall_seconds: float
     initialization_cpu_seconds: float
     read_wall_seconds: float
+    other_wall_seconds: float
     shard_wall_seconds_total: float
     shard_cpu_seconds_total: float
     peak_rss_bytes: int
@@ -561,6 +564,7 @@ class RunMetrics:
     terminal_idle_fraction: float
     read_fraction: float
     conversion_fraction: float
+    other_fraction: float
     document_percentiles: Mapping[str, float]
     shard_percentiles: Mapping[str, float]
 
@@ -583,8 +587,17 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
     peak_concurrency = _observed_peak_concurrency(starts, finishes)
     conversion_total = float(conversion_times.sum())
     initialization_total = sum(float(row["converter_initialization_wall_seconds"]) for row in shards)
+    read_total = sum(float(row["read_wall_seconds"]) for row in shards)
+    shard_wall_total = float(shard_times.sum())
+    other_total = shard_wall_total - initialization_total - read_total - conversion_total
+    if other_total < -1e-6:
+        raise ValueError("Measured initialization, read, and conversion time exceeds aggregate shard wall time")
+    other_total = max(0.0, other_total)
     initializations = sum(int(row["converter_initializations"]) for row in shards)
     table = _per_shard_maximum_document_share(documents)
+    failure_distribution = Counter(
+        str(row["error_kind"] or "UnknownError") for row in documents if not bool(row["success"])
+    )
     return RunMetrics(
         variant=str(shards[0]["variant"]),
         variant_role=str(shards[0]["variant_role"]),
@@ -596,7 +609,8 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
         lifecycle=str(shards[0]["lifecycle"]),
         runner=str(shards[0]["runner"]),
         documents=len(documents),
-        failures=sum(not bool(row["success"]) for row in documents),
+        failures=sum(failure_distribution.values()),
+        failure_distribution=dict(sorted(failure_distribution.items())),
         payload_bytes=sum(int(row["payload_bytes"]) for row in documents),
         extracted_bytes=sum(int(row["extracted_bytes"]) for row in documents),
         stage_wall_seconds=stage_wall,
@@ -604,8 +618,9 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
         conversion_cpu_seconds=sum(float(row["conversion_cpu_seconds"]) for row in documents),
         initialization_wall_seconds=initialization_total,
         initialization_cpu_seconds=sum(float(row["converter_initialization_cpu_seconds"]) for row in shards),
-        read_wall_seconds=sum(float(row["read_wall_seconds"]) for row in shards),
-        shard_wall_seconds_total=float(shard_times.sum()),
+        read_wall_seconds=read_total,
+        other_wall_seconds=other_total,
+        shard_wall_seconds_total=shard_wall_total,
         shard_cpu_seconds_total=sum(float(row["shard_cpu_seconds"]) for row in shards),
         peak_rss_bytes=max(int(row["peak_rss_bytes"]) for row in shards),
         average_cpu_percent=100
@@ -627,8 +642,9 @@ def derive_run_metrics(rows: Sequence[Mapping[str, object]]) -> RunMetrics:
         maximum_document_share_percentiles=_percentiles(np.asarray(list(table.values())), (50, 95, 99, 100)),
         worker_utilization=_divide(float(shard_times.sum()), peak_concurrency * stage_wall),
         terminal_idle_fraction=_terminal_slot_idle_fraction(starts, finishes, peak_concurrency),
-        read_fraction=_divide(sum(float(row["read_wall_seconds"]) for row in shards), float(shard_times.sum())),
-        conversion_fraction=_divide(conversion_total, float(shard_times.sum())),
+        read_fraction=_divide(read_total, shard_wall_total),
+        conversion_fraction=_divide(conversion_total, shard_wall_total),
+        other_fraction=_divide(other_total, shard_wall_total),
         document_percentiles=_percentiles(conversion_times, (50, 90, 95, 99, 99.9, 100)),
         shard_percentiles=_percentiles(shard_times, (50, 95, 99, 100)),
     )
@@ -862,8 +878,8 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
         "## Run overview",
         "",
         "| Run | Layout | Runner | Requested workers | Peak concurrency | Target/observed shards | Documents | "
-        "Wall time | Docs/s | Init | Read | Conversion | Utilization | Terminal idle |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "Wall time | Docs/s | Init/wall | Read | Conversion | Other | Utilization | Terminal idle |",
+        "| " + " | ".join(("---", "---", "---", *("---:",) * 12)) + " |",
     ]
     for metric in metrics:
         lines.append(
@@ -871,7 +887,8 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
             f"{metric.peak_concurrency} | {_target_shard_label(metric)}/{metric.observed_shards} | "
             f"{metric.documents:,} | "
             f"{_duration(metric.stage_wall_seconds)} | {_divide(metric.documents, metric.stage_wall_seconds):.2f} | "
-            f"{metric.initialization_fraction:.1%} | {metric.read_fraction:.1%} | {metric.conversion_fraction:.1%} | "
+            f"{_divide(metric.initialization_wall_seconds, metric.shard_wall_seconds_total):.1%} | "
+            f"{metric.read_fraction:.1%} | {metric.conversion_fraction:.1%} | {metric.other_fraction:.1%} | "
             f"{metric.worker_utilization:.1%} | {metric.terminal_idle_fraction:.1%} |"
         )
     lines.extend(
@@ -894,6 +911,39 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
             f"{metric.peak_rss_bytes / _MEBIBYTE:.0f} MiB | {metric.worker_seconds:.1f} | "
             f"{metric.failures} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Aggregate shard-time decomposition",
+            "",
+            "`Other = shard wall - initialization - read - conversion`. It is wall time not attributed to the three "
+            "explicitly timed operations.",
+            "",
+            "| Run | Shard wall | Initialization | Read | Conversion | Other |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for metric in metrics:
+        lines.append(
+            f"| `{metric.variant}` | {_duration(metric.shard_wall_seconds_total)} | "
+            f"{_duration(metric.initialization_wall_seconds)} | {_duration(metric.read_wall_seconds)} | "
+            f"{_duration(metric.conversion_wall_seconds)} | {_duration(metric.other_wall_seconds)} |"
+        )
+    lines.extend(["", "## Extraction failure distribution", ""])
+    if any(metric.failure_distribution for metric in metrics):
+        lines.extend(
+            [
+                "| Run | Error kind | Documents | Share of run failures |",
+                "| --- | --- | ---: | ---: |",
+            ]
+        )
+        for metric in metrics:
+            for error_kind, count in metric.failure_distribution.items():
+                lines.append(
+                    f"| `{metric.variant}` | `{error_kind}` | {count:,} | {_divide(count, metric.failures):.1%} |"
+                )
+    else:
+        lines.append("No document-level extraction failures were recorded.")
     representative = _representative_run(metrics)
     shard_p99_p50 = _divide(
         representative.shard_percentiles["p99"],
@@ -1003,6 +1053,8 @@ def _markdown_report(metrics: Sequence[RunMetrics], summary: Mapping[str, object
             "the process-local converter. It does not repeat Python imports for every shard.",
             "- Output writing occurs after rows are yielded and is represented in Zephyr stage statistics, "
             "not shard conversion rows.",
+            "- Other time includes profiling overhead and work outside the three explicit timers; compare it with "
+            "Zephyr stage statistics before assigning it to a specific cause.",
             "- Compare CPU-seconds per document across code changes; use wall time for scaling and straggler "
             "analysis only.",
         ]
@@ -1032,6 +1084,7 @@ def _dashboard_html(rows: Sequence[Mapping[str, object]], metrics: Sequence[RunM
     shards = [row for row in rows if row["row_kind"] == "shard"]
     figures = [
         _document_distribution_figure(documents),
+        _failure_distribution_figure(metrics),
         _shard_distribution_figure(shards),
         _maximum_document_share_figure(documents),
         _timeline_figure(shards),
@@ -1062,6 +1115,21 @@ def _document_distribution_figure(rows: Sequence[Mapping[str, object]]) -> tuple
         figure.add_trace(go.Histogram(x=values, name=variant, opacity=0.65, nbinsx=50))
     figure.update_layout(barmode="overlay", xaxis_title="Document conversion seconds", yaxis_title="Documents")
     return "Per-document conversion distribution", figure
+
+
+def _failure_distribution_figure(metrics: Sequence[RunMetrics]) -> tuple[str, go.Figure]:
+    error_kinds = sorted({error_kind for metric in metrics for error_kind in metric.failure_distribution})
+    figure = go.Figure()
+    for error_kind in error_kinds:
+        figure.add_trace(
+            go.Bar(
+                name=error_kind,
+                x=[metric.variant for metric in metrics],
+                y=[metric.failure_distribution.get(error_kind, 0) for metric in metrics],
+            )
+        )
+    figure.update_layout(barmode="stack", yaxis_title="Failed documents")
+    return "Extraction failure distribution", figure
 
 
 def _shard_distribution_figure(rows: Sequence[Mapping[str, object]]) -> tuple[str, go.Figure]:
@@ -1103,10 +1171,7 @@ def _decomposition_figure(metrics: Sequence[RunMetrics]) -> tuple[str, go.Figure
     init = [metric.initialization_wall_seconds for metric in metrics]
     read = [metric.read_wall_seconds for metric in metrics]
     conversion = [metric.conversion_wall_seconds for metric in metrics]
-    other = [
-        max(0.0, metric.shard_wall_seconds_total - init[index] - read[index] - conversion[index])
-        for index, metric in enumerate(metrics)
-    ]
+    other = [metric.other_wall_seconds for metric in metrics]
     figure = go.Figure()
     for label, values in (("Initialization", init), ("Read", read), ("Conversion", conversion), ("Other", other)):
         figure.add_trace(go.Bar(name=label, x=names, y=values))
@@ -1334,7 +1399,7 @@ def common_crawl_docx_profile_steps(
         name=f"profiling/common-crawl-docx/{slug}/report",
         fn=partial(render_profile_report, run_paths=tuple(run.output_path for run in runs)),
         deps=list(runs),
-        hash_attrs={"report_version": 2},
+        hash_attrs={"report_version": 3},
     )
     return preparation, runs, report
 
@@ -1361,6 +1426,7 @@ def main() -> None:
     parser.add_argument("--worker-counts", type=_comma_separated_ints, default=DEFAULT_WORKER_COUNTS)
     parser.add_argument("--target-shards", type=int)
     parser.add_argument("--shard-counts", type=_comma_separated_ints)
+    parser.add_argument("--skip-natural-layout", action="store_true")
     parser.add_argument("--skip-persistence", action="store_true")
     parser.add_argument("--maximum-zip-entries", type=int, default=DEFAULT_MAXIMUM_ZIP_ENTRIES)
     parser.add_argument("--maximum-uncompressed-bytes", type=int, default=DEFAULT_MAXIMUM_UNCOMPRESSED_BYTES)
@@ -1375,7 +1441,8 @@ def main() -> None:
     target_shards = args.target_shards or DEFAULT_PREPARATION_SHARDS
     worker_counts = tuple(args.worker_counts)
     variants = list(scaling_variants(target_shards=target_shards, worker_counts=worker_counts))
-    variants.extend(natural_layout_variants(worker_counts))
+    if not args.skip_natural_layout:
+        variants.extend(natural_layout_variants(worker_counts))
     shard_counts = tuple(args.shard_counts or default_profile_shard_counts(target_shards))
     variants.extend(
         worker_shard_size_variants(
