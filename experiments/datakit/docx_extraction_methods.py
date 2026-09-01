@@ -68,7 +68,7 @@ def _convert_docx(payload: bytes) -> Any:
 
     try:
         result = _docling_converter().convert(DocumentStream(name="document.docx", stream=io.BytesIO(payload)))
-    except (ConversionError, SecurityError) as error:
+    except (ConversionError, SecurityError, RuntimeError) as error:
         raise DocxExtractionError("Docling failed to extract the DOCX payload") from error
     return result.document
 
@@ -99,7 +99,6 @@ def _extracted_document(
     *,
     markdown: bool,
     tables_inline: bool,
-    image_placeholder: str = "<!-- image -->",
 ) -> ExtractedDocument:
     from docling_core.types.doc.labels import DocItemLabel  # noqa: PLC0415
 
@@ -107,7 +106,7 @@ def _extracted_document(
 
     def export(*, labels: set[Any] | None = None) -> str:
         if markdown:
-            return document.export_to_markdown(labels=labels, image_placeholder=image_placeholder)
+            return document.export_to_markdown(labels=labels, image_placeholder="")
         return document.export_to_text(labels=labels)
 
     if tables_inline:
@@ -145,26 +144,6 @@ def docling_markdown_inline_tables(payload: bytes) -> ExtractedDocument:
 def docling_markdown_tables_at_end(payload: bytes) -> ExtractedDocument:
     """Serialize Markdown with tables moved after all non-table content."""
     return _extracted_document(_convert_docx(payload), markdown=True, tables_inline=False)
-
-
-def docling_markdown_inline_tables_without_image_placeholders(payload: bytes) -> ExtractedDocument:
-    """Serialize inline Markdown tables while omitting image placeholders."""
-    return _extracted_document(
-        _convert_docx(payload),
-        markdown=True,
-        tables_inline=True,
-        image_placeholder="",
-    )
-
-
-def docling_markdown_tables_at_end_without_image_placeholders(payload: bytes) -> ExtractedDocument:
-    """Serialize Markdown tables at the end while omitting image placeholders."""
-    return _extracted_document(
-        _convert_docx(payload),
-        markdown=True,
-        tables_inline=False,
-        image_placeholder="",
-    )
 
 
 def _remove_markdown_markers(text: str) -> str:
@@ -213,23 +192,13 @@ DOCX_EXTRACTION_METHODS = {
     ),
     "docling-markdown-inline": ExtractionMethod(
         "docling-markdown-inline",
-        "v1",
+        "v2",
         docling_markdown_inline_tables,
     ),
     "docling-markdown-tables-at-end": ExtractionMethod(
         "docling-markdown-tables-at-end",
-        "v1",
+        "v2",
         docling_markdown_tables_at_end,
-    ),
-    "docling-markdown-inline-no-image-placeholders": ExtractionMethod(
-        "docling-markdown-inline-no-image-placeholders",
-        "v1",
-        docling_markdown_inline_tables_without_image_placeholders,
-    ),
-    "docling-markdown-tables-at-end-no-image-placeholders": ExtractionMethod(
-        "docling-markdown-tables-at-end-no-image-placeholders",
-        "v1",
-        docling_markdown_tables_at_end_without_image_placeholders,
     ),
 }
 

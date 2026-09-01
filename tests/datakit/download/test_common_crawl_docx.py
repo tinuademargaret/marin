@@ -40,9 +40,7 @@ from PIL import Image
 from experiments.datakit.common_crawl_docx_sample import sample_report_markdown
 from experiments.datakit.docx_extraction_methods import (
     docling_markdown_inline_tables,
-    docling_markdown_inline_tables_without_image_placeholders,
     docling_markdown_tables_at_end,
-    docling_markdown_tables_at_end_without_image_placeholders,
     docling_plain_text_inline_tables,
     docling_plain_text_tables_at_end,
     docling_without_markdown_markers,
@@ -305,25 +303,20 @@ def test_factorial_extraction_methods_vary_only_format_and_table_placement(
 
 
 @pytest.mark.parametrize(
-    ("keep_extractor", "remove_extractor"),
+    "extractor",
     [
-        (docling_markdown_inline_tables, docling_markdown_inline_tables_without_image_placeholders),
-        (docling_markdown_tables_at_end, docling_markdown_tables_at_end_without_image_placeholders),
+        DoclingDocxExtractor().extract,
+        docling_markdown_inline_tables,
+        docling_markdown_tables_at_end,
     ],
 )
-def test_markdown_image_placeholder_treatments_change_only_placeholder_policy(
-    keep_extractor: Callable[[bytes], ExtractedDocument],
-    remove_extractor: Callable[[bytes], ExtractedDocument],
+def test_markdown_extraction_omits_image_placeholders(
+    extractor: Callable[[bytes], ExtractedDocument],
 ) -> None:
-    payload = _real_docx_with_image()
+    extracted = extractor(_real_docx_with_image())
 
-    kept = keep_extractor(payload)
-    removed = remove_extractor(payload)
-
-    assert kept.image_count == removed.image_count == 1
-    assert "<!-- image -->" in kept.text
-    assert "<!-- image -->" not in removed.text
-    assert kept.text.replace("\n\n<!-- image -->", "") == removed.text
+    assert extracted.image_count == 1
+    assert "<!-- image -->" not in extracted.text
 
 
 def test_lingua_detector_identifies_multilingual_fixture() -> None:
