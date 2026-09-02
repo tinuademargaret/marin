@@ -246,3 +246,6 @@ scr/*
 .obsidian
 .cw_env
 .localbin/
+
+# Output
+docx-extraction-samples/*

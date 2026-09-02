@@ -11,6 +11,7 @@ from functools import cache
 from typing import Any
 
 from marin.datakit.download.common_crawl_docx import (
+    DOCLING_IMAGE_PLACEHOLDER,
     DoclingDocxExtractor,
     DocumentBlock,
     DocxExtractionError,
@@ -73,24 +74,57 @@ def _convert_docx(payload: bytes) -> Any:
     return result.document
 
 
-def _table_markdown(document: Any) -> tuple[str, ...]:
-    return tuple(table.export_to_markdown(document).strip() for table in document.tables)
+def _has_table_ancestor(item: Any, document: Any, table_type: type[Any]) -> bool:
+    parent = item.parent
+    while parent is not None:
+        parent_item = parent.resolve(document)
+        if isinstance(parent_item, table_type):
+            return True
+        parent = parent_item.parent
+    return False
 
 
-def _inline_blocks(text: str, tables: tuple[str, ...]) -> tuple[DocumentBlock, ...]:
-    """Split a Docling serialization into prose and table blocks without changing it."""
+def _coalesce_blocks(blocks: Iterable[DocumentBlock]) -> tuple[DocumentBlock, ...]:
+    coalesced: list[DocumentBlock] = []
+    for block in blocks:
+        if coalesced and coalesced[-1].is_table == block.is_table:
+            previous = coalesced[-1]
+            coalesced[-1] = DocumentBlock(text=f"{previous.text}\n\n{block.text}", is_table=block.is_table)
+        else:
+            coalesced.append(block)
+    return tuple(coalesced)
+
+
+def _structured_blocks(
+    document: Any,
+    *,
+    markdown: bool,
+    image_placeholder: str,
+) -> tuple[DocumentBlock, ...]:
+    """Serialize Docling items in reading order without inferring structure from text."""
+    from docling_core.transforms.serializer.markdown import MarkdownDocSerializer, MarkdownParams  # noqa: PLC0415
+    from docling_core.transforms.serializer.plain_text import PlainTextDocSerializer, PlainTextParams  # noqa: PLC0415
+    from docling_core.types.doc.document import TableItem  # noqa: PLC0415
+
+    if markdown:
+        serializer = MarkdownDocSerializer(doc=document, params=MarkdownParams(image_placeholder=image_placeholder))
+    else:
+        serializer = PlainTextDocSerializer(doc=document, params=PlainTextParams(image_placeholder=image_placeholder))
+
     blocks: list[DocumentBlock] = []
-    cursor = 0
-    for table in tables:
-        table_start = text.find(table, cursor)
-        if table_start < 0:
-            raise ValueError("Docling table serialization was not present in document serialization")
-        if prose := text[cursor:table_start].strip():
-            blocks.append(DocumentBlock(text=prose, is_table=False))
-        blocks.append(DocumentBlock(text=table, is_table=True))
-        cursor = table_start + len(table)
-    if prose := text[cursor:].strip():
-        blocks.append(DocumentBlock(text=prose, is_table=False))
+    serialized_tables: set[str] = set()
+    for item, _level in document.iterate_items():
+        if _has_table_ancestor(item, document, TableItem):
+            continue
+        is_table = isinstance(item, TableItem)
+        if text := serializer.serialize(item=item).text.strip():
+            blocks.append(DocumentBlock(text=text, is_table=is_table))
+        if is_table:
+            serialized_tables.add(item.self_ref)
+
+    for table in document.tables:
+        if table.self_ref not in serialized_tables and (text := serializer.serialize(item=table).text.strip()):
+            blocks.append(DocumentBlock(text=text, is_table=True))
     return tuple(blocks)
 
 
@@ -99,30 +133,23 @@ def _extracted_document(
     *,
     markdown: bool,
     tables_inline: bool,
+    image_placeholder: str = DOCLING_IMAGE_PLACEHOLDER,
 ) -> ExtractedDocument:
-    from docling_core.types.doc.labels import DocItemLabel  # noqa: PLC0415
-
-    tables = _table_markdown(document)
-
-    def export(*, labels: set[Any] | None = None) -> str:
-        if markdown:
-            return document.export_to_markdown(labels=labels, image_placeholder="")
-        return document.export_to_text(labels=labels)
-
+    blocks = _structured_blocks(document, markdown=markdown, image_placeholder=image_placeholder)
     if tables_inline:
-        blocks = _inline_blocks(export().strip(), tables)
+        ordered_blocks = blocks
     else:
-        non_table_labels = set(DocItemLabel) - {DocItemLabel.TABLE}
-        body = export(labels=non_table_labels).strip()
-        body_blocks = (DocumentBlock(text=body, is_table=False),) if body else ()
-        blocks = (*body_blocks, *(DocumentBlock(text=table, is_table=True) for table in tables))
-    text = "\n\n".join(block.text for block in blocks)
+        body_blocks = tuple(block for block in blocks if not block.is_table)
+        table_blocks = tuple(block for block in blocks if block.is_table)
+        ordered_blocks = (*body_blocks, *table_blocks)
+    language_blocks = _coalesce_blocks(ordered_blocks)
+    text = "\n\n".join(block.text for block in language_blocks)
     return ExtractedDocument(
         text=text,
         word_count=len(text.split()),
         table_count=len(document.tables),
         image_count=len(document.pictures),
-        language_blocks=blocks,
+        language_blocks=language_blocks,
     )
 
 
@@ -146,7 +173,26 @@ def docling_markdown_tables_at_end(payload: bytes) -> ExtractedDocument:
     return _extracted_document(_convert_docx(payload), markdown=True, tables_inline=False)
 
 
-def _remove_markdown_markers(text: str) -> str:
+def docling_without_image_placeholders(payload: bytes) -> ExtractedDocument:
+    """Use the default extraction and remove image position placeholders."""
+    extracted = docling_default(payload)
+    blocks = tuple(
+        DocumentBlock(text=block.text.replace(DOCLING_IMAGE_PLACEHOLDER, "").strip(), is_table=block.is_table)
+        for block in extracted.language_blocks
+        if block.text.replace(DOCLING_IMAGE_PLACEHOLDER, "").strip()
+    )
+    text = "\n\n".join(block.text for block in blocks)
+    return ExtractedDocument(
+        text=text,
+        word_count=len(text.split()),
+        table_count=extracted.table_count,
+        image_count=extracted.image_count,
+        language_blocks=blocks,
+    )
+
+
+def remove_markdown_markers(text: str) -> str:
+    """Remove common Markdown presentation markers without changing prose."""
     text = _MARKDOWN_HEADING.sub("", text)
     text = _MARKDOWN_LINK.sub(r"\1", text)
     text = _MARKDOWN_STRONG_ASTERISKS.sub(r"\1", text)
@@ -160,7 +206,7 @@ def docling_without_markdown_markers(payload: bytes) -> ExtractedDocument:
     """Run Docling and remove common Markdown presentation markers from its text."""
     extracted = docling_default(payload)
     blocks = tuple(
-        DocumentBlock(text=_remove_markdown_markers(block.text), is_table=block.is_table)
+        DocumentBlock(text=remove_markdown_markers(block.text), is_table=block.is_table)
         for block in extracted.language_blocks
     )
     text = "\n\n".join(block.text for block in blocks)
@@ -179,6 +225,11 @@ DOCX_EXTRACTION_METHODS = {
         "docling-without-markdown-markers",
         "v1",
         docling_without_markdown_markers,
+    ),
+    "docling-without-image-placeholders": ExtractionMethod(
+        "docling-without-image-placeholders",
+        "v1",
+        docling_without_image_placeholders,
     ),
     "docling-plain-inline": ExtractionMethod(
         "docling-plain-inline",

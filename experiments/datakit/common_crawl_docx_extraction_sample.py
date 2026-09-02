@@ -15,6 +15,7 @@ Example::
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -24,16 +25,32 @@ from dataclasses import asdict, dataclass
 
 import fsspec
 import pyarrow.parquet as pq
-from marin.datakit.download.common_crawl_docx import CommonCrawlDocxStageResult, DocxExtractionError
+from marin.datakit.download.common_crawl_docx import (
+    DOCLING_IMAGE_PLACEHOLDER,
+    CommonCrawlDocxStageResult,
+    DocumentBlock,
+    DocxExtractionError,
+)
 from marin.execution.artifact import read_artifact
 from rigging.filesystem import prefix_join, url_to_fs
 from rigging.log_setup import configure_logging
 
-from experiments.datakit.docx_extraction_methods import DOCX_EXTRACTION_METHODS, ExtractionMethod, extraction_methods
+from experiments.datakit.docx_extraction_methods import (
+    DOCX_EXTRACTION_METHODS,
+    ExtractionMethod,
+    extraction_methods,
+    remove_markdown_markers,
+)
 
 DEFAULT_MAXIMUM_REPORT_CHARACTERS = 8_000
 _BACKTICK_RUN = re.compile(r"`+")
 _SAMPLE_COLUMNS = ("payload", "source_id", "crawl_id", "url", "selection_reason")
+_FACTORIAL_COMPARISONS = (
+    ("Plain table placement", "docling-plain-inline", "docling-plain-tables-at-end"),
+    ("Markdown table placement", "docling-markdown-inline", "docling-markdown-tables-at-end"),
+    ("Inline serialization", "docling-plain-inline", "docling-markdown-inline"),
+    ("Tables-at-end serialization", "docling-plain-tables-at-end", "docling-markdown-tables-at-end"),
+)
 
 
 @dataclass(frozen=True)
@@ -61,7 +78,16 @@ class ExtractionSample:
     word_count: int | None
     table_count: int | None
     image_count: int | None
+    substantive_text_digest: str | None
+    survives_blank_text_filter: bool
     error: str | None
+
+
+def _substantive_text_digest(blocks: tuple[DocumentBlock, ...]) -> str:
+    prose = "\n\n".join(block.text for block in blocks if not block.is_table)
+    prose = remove_markdown_markers(prose.replace(DOCLING_IMAGE_PLACEHOLDER, ""))
+    normalized = " ".join(prose.split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _full_path(protocol: str | None, path: str) -> str:
@@ -147,6 +173,8 @@ def extract_samples(
                         word_count=None,
                         table_count=None,
                         image_count=None,
+                        substantive_text_digest=None,
+                        survives_blank_text_filter=False,
                         error=f"{type(error).__name__}: {error}",
                     )
                 )
@@ -163,6 +191,8 @@ def extract_samples(
                     word_count=extracted.word_count,
                     table_count=extracted.table_count,
                     image_count=extracted.image_count,
+                    substantive_text_digest=_substantive_text_digest(extracted.language_blocks),
+                    survives_blank_text_filter=bool(extracted.text.strip()),
                     error=None,
                 )
             )
@@ -173,6 +203,76 @@ def _fenced_text(text: str) -> str:
     longest_run = max((len(match.group()) for match in _BACKTICK_RUN.finditer(text)), default=0)
     fence = "`" * max(3, longest_run + 1)
     return f"{fence}text\n{text}\n{fence}"
+
+
+def _diagnostic_markdown(samples: tuple[ExtractionSample, ...]) -> list[str]:
+    by_method: dict[str, dict[str, ExtractionSample]] = {}
+    for sample in samples:
+        by_method.setdefault(sample.method, {})[sample.source_id] = sample
+
+    lines = [
+        "## Diagnostics",
+        "",
+        "Retention below models the normalizer's missing-or-blank `text` filter. It does not rerun "
+        "language identification or deduplication.",
+        "",
+        "| Method | Sampled | Extracted | Survives blank-text filter | Failed |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    retained_by_method: dict[str, set[str]] = {}
+    for method, method_samples in by_method.items():
+        extracted = sum(sample.error is None for sample in method_samples.values())
+        retained = {sample.source_id for sample in method_samples.values() if sample.survives_blank_text_filter}
+        retained_by_method[method] = retained
+        lines.append(
+            f"| `{method}` | {len(method_samples)} | {extracted} | {len(retained)} | {len(method_samples) - extracted} |"
+        )
+
+    retained_sets = tuple(retained_by_method.values())
+    common_ids = set.intersection(*retained_sets) if retained_sets else set()
+    union_ids = set.union(*retained_sets) if retained_sets else set()
+    retention_matches = all(ids == retained_sets[0] for ids in retained_sets[1:]) if retained_sets else True
+    lines.extend(
+        [
+            "",
+            "### Retained source-ID agreement",
+            "",
+            f"All methods retain the same source IDs: **{'yes' if retention_matches else 'no'}**. "
+            f"Common retained IDs: {len(common_ids)}; union: {len(union_ids)}.",
+        ]
+    )
+    if not retention_matches:
+        lines.extend(["", "| Method | IDs not retained by every method |", "| --- | --- |"])
+        for method, retained in retained_by_method.items():
+            differing = sorted(union_ids - retained)
+            lines.append(f"| `{method}` | {', '.join(f'`{source_id}`' for source_id in differing) or 'none'} |")
+
+    lines.extend(
+        [
+            "",
+            "### Factorial integrity",
+            "",
+            "Substantive prose excludes table blocks, image placeholders, common Markdown presentation markers, "
+            "and whitespace-only differences.",
+            "",
+            "| Comparison | Comparable IDs | Matching prose | Mismatches |",
+            "| --- | ---: | ---: | --- |",
+        ]
+    )
+    for label, left_method, right_method in _FACTORIAL_COMPARISONS:
+        if left_method not in by_method or right_method not in by_method:
+            continue
+        comparable_ids = sorted(retained_by_method[left_method] & retained_by_method[right_method])
+        mismatches = [
+            source_id
+            for source_id in comparable_ids
+            if by_method[left_method][source_id].substantive_text_digest
+            != by_method[right_method][source_id].substantive_text_digest
+        ]
+        mismatch_text = ", ".join(f"`{source_id}`" for source_id in mismatches) or "none"
+        lines.append(f"| {label} | {len(comparable_ids)} | {len(comparable_ids) - len(mismatches)} | {mismatch_text} |")
+    lines.append("")
+    return lines
 
 
 def extraction_sample_markdown(
@@ -190,6 +290,7 @@ def extraction_sample_markdown(
         "Full text is retained in `samples.jsonl`.",
         "",
     ]
+    lines.extend(_diagnostic_markdown(samples))
     current_source_id: str | None = None
     for sample in samples:
         if sample.source_id != current_source_id:

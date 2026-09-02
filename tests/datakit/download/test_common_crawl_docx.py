@@ -43,6 +43,7 @@ from experiments.datakit.docx_extraction_methods import (
     docling_markdown_tables_at_end,
     docling_plain_text_inline_tables,
     docling_plain_text_tables_at_end,
+    docling_without_image_placeholders,
     docling_without_markdown_markers,
 )
 
@@ -105,6 +106,21 @@ def _real_docx_with_image() -> bytes:
     document.add_paragraph("Text before the image.")
     document.add_picture(image)
     document.add_paragraph("Text after the image.")
+    document.save(output)
+    return output.getvalue()
+
+
+def _real_docx_with_multiple_tables() -> bytes:
+    output = io.BytesIO()
+    document = Document()
+    document.add_paragraph("Before all tables.")
+    for index in range(3):
+        table = document.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = f"Header {index}"
+        table.cell(0, 1).text = "Value"
+        table.cell(1, 0).text = f"Row {index}"
+        table.cell(1, 1).text = str(index)
+        document.add_paragraph(f"After table {index}.")
     document.save(output)
     return output.getvalue()
 
@@ -305,18 +321,49 @@ def test_factorial_extraction_methods_vary_only_format_and_table_placement(
 @pytest.mark.parametrize(
     "extractor",
     [
-        DoclingDocxExtractor().extract,
+        docling_plain_text_inline_tables,
+        docling_plain_text_tables_at_end,
         docling_markdown_inline_tables,
         docling_markdown_tables_at_end,
     ],
 )
-def test_markdown_extraction_omits_image_placeholders(
+def test_factorial_extraction_methods_serialize_each_structured_table(
+    extractor: Callable[[bytes], ExtractedDocument],
+) -> None:
+    extracted = extractor(_real_docx_with_multiple_tables())
+
+    assert extracted.table_count == 3
+    for index in range(3):
+        assert extracted.text.count(f"Header {index}") == 1
+        assert extracted.text.count(f"After table {index}.") == 1
+
+
+@pytest.mark.parametrize(
+    "extractor",
+    [
+        DoclingDocxExtractor().extract,
+        docling_plain_text_inline_tables,
+        docling_plain_text_tables_at_end,
+        docling_markdown_inline_tables,
+        docling_markdown_tables_at_end,
+    ],
+)
+def test_extraction_methods_preserve_image_placeholders_by_default(
     extractor: Callable[[bytes], ExtractedDocument],
 ) -> None:
     extracted = extractor(_real_docx_with_image())
 
     assert extracted.image_count == 1
+    assert "<!-- image -->" in extracted.text
+
+
+def test_image_placeholder_ablation_removes_only_the_placeholder() -> None:
+    extracted = docling_without_image_placeholders(_real_docx_with_image())
+
+    assert extracted.image_count == 1
     assert "<!-- image -->" not in extracted.text
+    assert "Text before the image." in extracted.text
+    assert "Text after the image." in extracted.text
 
 
 def test_lingua_detector_identifies_multilingual_fixture() -> None:

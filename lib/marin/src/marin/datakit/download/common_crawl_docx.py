@@ -54,8 +54,9 @@ DEFAULT_LANGUAGE_MINIMUM_ALPHA_RATIO = 0.2
 DEFAULT_LANGUAGE_MAXIMUM_TABLE_ALPHA_BYTES = 1_000
 DEFAULT_LANGUAGE_DISTRIBUTION_TOP_K = 5
 DEFAULT_LANGUAGE_MINIMUM_SCORE = 0.5
-EXTRACTOR_VERSION = "docling-2.99.0-smart-markdown-v3"
+EXTRACTOR_VERSION = "docling-2.99.0-smart-markdown-v4"
 LANGUAGE_DETECTOR_VERSION = "lingua-2.2.0-chunk-weighted-v2"
+DOCLING_IMAGE_PLACEHOLDER = "<!-- image -->"
 
 _REQUIRED_DOCX_MEMBERS = frozenset({"[Content_Types].xml", "word/document.xml"})
 
@@ -335,7 +336,7 @@ def _extracted_document(document: Any) -> ExtractedDocument:
 
     non_table_content = document.export_to_markdown(
         labels=set(DocItemLabel) - {DocItemLabel.TABLE},
-        image_placeholder="",
+        image_placeholder=DOCLING_IMAGE_PLACEHOLDER,
     ).strip()
     tables: list[str] = []
     for table in document.tables:
