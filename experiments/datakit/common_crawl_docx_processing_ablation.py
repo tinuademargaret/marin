@@ -1,18 +1,18 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build extraction treatments from existing Common Crawl DOCX fetches.
+"""Build extraction treatments from an existing Common Crawl DOCX fetch.
 
-The fetched parent must contain ``fetched_*`` stage directories with
-``.artifact.json`` and ``data`` children. Use its ``gs://`` path when data and
-compute are in the same region. For cross-region data, use a ``mirror://``
-source after confirming that the copy is within the approved transfer budget.
-Every extraction treatment reads the same resolved inputs, then runs language
-identification and normalization independently::
+The fetched input must be the stage root containing ``.artifact.json`` and a
+``data`` child. Use its ``gs://`` path when data and compute are in the same
+region. For cross-region data, use a ``mirror://`` source after confirming that
+the copy is within the approved transfer budget. Every extraction treatment
+reads the same input, then runs language identification and normalization
+independently::
 
     uv run --package marin-core --extra datakit python \
       -m experiments.datakit.common_crawl_docx_processing_ablation \
-      --fetched-parent gs://bucket/run \
+      --fetched-input-path gs://bucket/run/fetched_HASH \
       --fetched-version 2026.09.02 \
       --crawl-id CC-MAIN-2026-34 \
       --paths-manifest-url https://data.commoncrawl.org/crawl-data/CC-MAIN-2026-34/warc.paths.gz \
@@ -24,7 +24,6 @@ Use ``--dry-run`` to inspect the graph without launching it.
 """
 
 import argparse
-import hashlib
 import logging
 from dataclasses import dataclass, replace
 from functools import partial
@@ -63,61 +62,33 @@ class ProcessingVariant:
     normalized: StepSpec
 
 
-def fetched_step_paths(fetched_parent: str) -> tuple[str, ...]:
-    """Discover fetched stage roots containing artifact records under a parent."""
-    artifact_pattern = prefix_join(fetched_parent.rstrip("/"), "fetched_*/.artifact.json")
-    fs, resolved_pattern = url_to_fs(artifact_pattern)
-    protocol = artifact_pattern.partition("://")[0] if "://" in artifact_pattern else ""
-    artifact_paths = sorted(fs.glob(resolved_pattern))
-    if not artifact_paths:
-        raise FileNotFoundError(f"No fetched artifact directories matched {artifact_pattern}")
-    suffix = "/.artifact.json"
-    fetched_paths: list[str] = []
-    for path in artifact_paths:
-        root = path.removesuffix(suffix)
-        fetched_path = f"{protocol}://{root}" if protocol else root
-        data_pattern = prefix_join(fetched_path, "data/**/*.parquet")
-        data_fs, resolved_data_pattern = url_to_fs(data_pattern)
-        if not data_fs.glob(resolved_data_pattern):
-            raise FileNotFoundError(f"No fetched Parquet shards matched {data_pattern}")
-        fetched_paths.append(fetched_path)
-    return tuple(fetched_paths)
-
-
-def combined_fetched_input_path(fetched_step_paths: tuple[str, ...]) -> str:
-    """Return one brace-expanded root for fetched stages under the same parent."""
-    fetched_sources = tuple(sorted({path.rstrip("/") for path in fetched_step_paths}))
-    parents = {source.rpartition("/")[0] for source in fetched_sources}
-    if len(parents) != 1:
-        raise ValueError("Fetched stage roots must share one parent directory")
-    if len(fetched_sources) == 1:
-        return fetched_sources[0]
-    parent = parents.pop()
-    basenames = (source.rpartition("/")[2] for source in fetched_sources)
-    return f"{parent}/{{{','.join(basenames)}}}"
+def validated_fetched_input_path(fetched_input_path: str) -> str:
+    """Validate and return a fetched stage root containing Parquet shards."""
+    fetched_input_path = fetched_input_path.rstrip("/")
+    input_glob = prefix_join(fetched_input_path, "data/**/*.parquet")
+    fs, resolved = url_to_fs(input_glob)
+    if not fs.glob(resolved):
+        raise FileNotFoundError(f"No fetched Parquet shards match {input_glob}")
+    return fetched_input_path
 
 
 def processing_variants(
     config: CommonCrawlDocxConfig,
     *,
-    fetched_step_paths: tuple[str, ...],
+    fetched_input_path: str,
     fetched_version: str,
     methods: tuple[ExtractionMethod, ...],
     output_path_prefix: str | None,
 ) -> dict[str, ProcessingVariant]:
-    """Build treatment graphs sharing previously materialized fetched artifacts."""
-    fetched_sources = tuple(sorted({path.rstrip("/") for path in fetched_step_paths}))
-    fetched_input_path = combined_fetched_input_path(fetched_sources)
-    fetched_handles = tuple(
-        ArtifactStep.adopt(
-            f"inputs/common-crawl-docx-fetched/{config.name.lower()}/{hashlib.sha256(source.encode()).hexdigest()[:8]}",
-            fetched_version,
-            source=source,
-            kind=Artifact,
-        )
-        for source in fetched_sources
+    """Build treatment graphs sharing one previously materialized fetched artifact."""
+    fetched_input_path = validated_fetched_input_path(fetched_input_path)
+    fetched_handle = ArtifactStep.adopt(
+        f"inputs/common-crawl-docx-fetched/{config.name.lower()}",
+        fetched_version,
+        source=fetched_input_path,
+        kind=Artifact,
     )
-    fetched = [replace(handle.lower(), output_path_prefix=output_path_prefix) for handle in fetched_handles]
+    fetched = replace(fetched_handle.lower(), output_path_prefix=output_path_prefix)
     detector = LinguaLanguageDetector()
     variants: dict[str, ProcessingVariant] = {}
     for method in methods:
@@ -134,7 +105,7 @@ def processing_variants(
                 resources=ResourceConfig(cpu=1, ram="4g"),
                 pip_dependency_groups=["datakit"],
             ),
-            deps=fetched,
+            deps=[fetched],
             hash_attrs={
                 "maximum_zip_entries": config.maximum_zip_entries,
                 "maximum_uncompressed_bytes": config.maximum_uncompressed_bytes,
@@ -187,9 +158,9 @@ def processing_variants(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--fetched-parent",
+        "--fetched-input-path",
         required=True,
-        help="Parent containing disjoint fetched_* stage directories.",
+        help="Fetched stage root containing .artifact.json and data/.",
     )
     parser.add_argument(
         "--fetched-version",
@@ -223,13 +194,9 @@ def main() -> None:
         ),
         max_workers=args.max_workers,
     )
-    resolved_fetched_paths = fetched_step_paths(args.fetched_parent)
-    print("Fetched inputs:")
-    for path in resolved_fetched_paths:
-        print(f"- {path}")
     variants = processing_variants(
         config,
-        fetched_step_paths=resolved_fetched_paths,
+        fetched_input_path=args.fetched_input_path,
         fetched_version=args.fetched_version,
         methods=extraction_methods(args.extraction_methods),
         output_path_prefix=args.output_prefix,
