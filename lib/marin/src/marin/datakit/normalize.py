@@ -456,7 +456,12 @@ def normalize_to_parquet(
         bare=bare,
         output_schema=output_schema,
     )
-    ctx = ZephyrContext(name="normalize", resources=resources, max_workers=max_workers)
+    ctx = ZephyrContext(
+        name="normalize",
+        resources=resources,
+        max_workers=max_workers,
+        chunk_storage_prefix=prefix_join(output_path, "_zephyr"),
+    )
     outcome = ctx.execute(pipeline)
     counters_dict = dict(outcome.counters)
 

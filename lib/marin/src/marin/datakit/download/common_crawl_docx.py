@@ -541,6 +541,7 @@ def extract_common_crawl_docx(
         name=f"common-crawl-docx-extraction-{config.name}",
         resources=ResourceConfig(cpu=2, ram="16g"),
         max_workers=config.max_workers,
+        chunk_storage_prefix=prefix_join(output_path, "_zephyr"),
     ).execute(pipeline)
     return CommonCrawlDocxStageResult(data_dir=prefix_join(output_path, "data"), counters=dict(outcome.counters))
 
@@ -718,6 +719,7 @@ def identify_common_crawl_docx_language(
         name=f"common-crawl-docx-language-identification-{config.name}",
         resources=ResourceConfig(cpu=2, ram="8g"),
         max_workers=config.max_workers,
+        chunk_storage_prefix=prefix_join(output_path, "_zephyr"),
     ).execute(pipeline)
     return CommonCrawlDocxStageResult(data_dir=prefix_join(output_path, "data"), counters=dict(outcome.counters))
 

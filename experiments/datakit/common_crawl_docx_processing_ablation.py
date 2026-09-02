@@ -110,6 +110,7 @@ def processing_variants(
                 "maximum_zip_entries": config.maximum_zip_entries,
                 "maximum_uncompressed_bytes": config.maximum_uncompressed_bytes,
                 "extractor": method.identity,
+                "chunk_storage": "output-local",
                 "schema_version": 5,
             },
             output_path_prefix=output_path_prefix,
