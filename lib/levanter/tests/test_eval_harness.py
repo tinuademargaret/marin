@@ -1,11 +1,13 @@
 # Copyright The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import haliax as hax
+import jax
 from test_utils import skip_if_module_missing
 from transformers import AutoTokenizer
 
 from levanter.data.packing import PromptCompletion
-from levanter.eval_harness import LmEvalHarnessConfig, TaskConfig, _iterate_tokenized_requests
+from levanter.eval_harness import LmEvalHarnessConfig, TaskConfig, _iterate_tokenized_requests, _pack_requests
 
 
 @skip_if_module_missing("lm_eval")
@@ -159,6 +161,10 @@ def test_iterate_tokenized_requests():
         # Sequence length should be within max_len
         assert len(result.ids) <= max_len
 
+    packed = _pack_requests(requests, hf_tokenizer, hax.Axis("position", max_len), 8, hf_tokenizer.pad_token_id)
+    platforms = {device.platform for leaf in jax.tree.leaves(packed) for device in leaf.devices()}
+    assert platforms == {"cpu"}
+
 
 @skip_if_module_missing("lm_eval")
 def test_task_config():
@@ -188,7 +194,15 @@ def test_task_config():
 @skip_if_module_missing("lm_eval")
 def test_registered_task_accepts_fewshot_override():
     config = LmEvalHarnessConfig(
-        task_spec=[TaskConfig(task="boolq", num_fewshot=10, dataset_path="aps/super_glue")],
+        task_spec=[
+            TaskConfig(
+                task="boolq",
+                num_fewshot=10,
+                dataset_path="aps/super_glue",
+                doc_to_target="{{label}}",
+                fewshot_split="train",
+            )
+        ],
     )
 
     task_dict = config.to_task_dict()
@@ -197,3 +211,6 @@ def test_registered_task_accepts_fewshot_override():
     task = next(iter(task_dict.values()))
     assert task.config.num_fewshot == 10
     assert task.config.dataset_path == "aps/super_glue"
+    assert task.config.doc_to_target == "{{label}}"
+    assert task.fewshot_cfg.doc_to_target == "{{label}}"
+    assert task.fewshot_cfg.split == "train"

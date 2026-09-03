@@ -10,8 +10,6 @@ from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
-from pydantic import ValidationError
-
 from marin.datakit.download.common_crawl_docx import (
     DOCLING_IMAGE_PLACEHOLDER,
     DoclingDocxExtractor,
@@ -19,6 +17,7 @@ from marin.datakit.download.common_crawl_docx import (
     DocxExtractionError,
     ExtractedDocument,
 )
+from pydantic import ValidationError
 
 _MARKDOWN_HEADING = re.compile(r"(?m)^\s{0,3}#{1,6}[ \t]+")
 _MARKDOWN_LINK = re.compile(r"\[([^]\n]+)]\([^\n)]+\)")

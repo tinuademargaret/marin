@@ -87,13 +87,24 @@ from levanter.data.utils import batched
 from levanter.data.loader import stack_batches
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, split_activations
 from levanter.trainer import TrainerConfig
-from levanter.utils.jax_utils import broadcast_shard, parameter_count, use_cpu_device
+from levanter.utils.jax_utils import broadcast_shard, local_cpu_mesh, parameter_count, use_cpu_device
 from levanter.utils.py_utils import FailSafeJSONEncoder
 from levanter.utils.tree_utils import inference_mode
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+_FEWSHOT_INHERITED_FIELDS = {
+    "doc_to_choice": "doc_to_choice",
+    "doc_to_target": "doc_to_target",
+    "doc_to_text": "doc_to_text",
+    "fewshot_delimiter": "fewshot_delimiter",
+    "fewshot_split": "split",
+    "gen_prefix": "gen_prefix",
+    "process_docs": "process_docs",
+    "target_delimiter": "target_delimiter",
+}
 
 
 def _call_with_retry(
@@ -1196,7 +1207,11 @@ class LmEvalHarnessConfig:
                 continue
             for field, value in overrides.items():
                 if field not in {"task", "task_alias", "additional_stop_strings"}:
+                    previous_value = getattr(task_obj.config, field)
                     setattr(task_obj.config, field, value)
+                    fewshot_field = _FEWSHOT_INHERITED_FIELDS.get(field)
+                    if fewshot_field is not None and getattr(task_obj.fewshot_cfg, fewshot_field) == previous_value:
+                        setattr(task_obj.fewshot_cfg, fewshot_field, value)
 
     def _rename_tasks_for_eval_harness(self, this_task, lm_eval_task_name, our_name):
         from lm_eval.api.group import ConfigurableGroup  # noqa: PLC0415  # optional dep: lm_eval
@@ -1770,14 +1785,15 @@ def _pack_requests(
     max_pack_size: int,
     pad_token_id: int,
 ) -> list[LmExample]:
-    packed_iterator = _iterate_tokenized_requests(requests, tokenizer, Pos.size, batch_size=128)
-    # TODO: use a better packing algorithm?
-    return greedy_pack_prompt_completions(
-        Pos,
-        packed_iterator,
-        max_segments_per_example=max_pack_size,
-        pad_token=pad_token_id,
-    )
+    with local_cpu_mesh():
+        packed_iterator = _iterate_tokenized_requests(requests, tokenizer, Pos.size, batch_size=128)
+        # TODO: use a better packing algorithm?
+        return greedy_pack_prompt_completions(
+            Pos,
+            packed_iterator,
+            max_segments_per_example=max_pack_size,
+            pad_token=pad_token_id,
+        )
 
 
 def _make_dummy_batch(EvalBatch, EvalPos):

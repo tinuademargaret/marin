@@ -9,7 +9,11 @@ from marin.evaluation.evaluation_config import EvalTaskConfig
 # subset from from page 43 of the DCLM paper: https://arxiv.org/pdf/2406.11794
 # TODO: add more once supported in lm-eval-harness and/or tested on our end
 CORE_TASKS = (
-    EvalTaskConfig("agieval_lsat_ar", 3),  # 3-shot tests in legal domain
+    EvalTaskConfig(
+        "agieval_lsat_ar",
+        3,
+        task_kwargs={"doc_to_target": "{{gold[0]}}"},
+    ),  # 3-shot tests in legal domain
     EvalTaskConfig("arc_easy", 10),  # 10-shot, four-way MCQ questions involving grade 3-9 basic science
     EvalTaskConfig("arc_challenge", 10),  # a (harder) version of arc_easy
     EvalTaskConfig(
