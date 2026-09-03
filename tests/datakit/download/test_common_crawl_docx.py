@@ -36,9 +36,11 @@ from marin.datakit.download.common_crawl_plan import (
 )
 from marin.datakit.download.common_crawl_warc import CommonCrawlWarcRecord, content_digest, main_record_from_index_row
 from PIL import Image
+from pydantic import TypeAdapter
 
 from experiments.datakit.common_crawl_docx_sample import sample_report_markdown
 from experiments.datakit.docx_extraction_methods import (
+    ExtractionMethod,
     docling_markdown_inline_tables,
     docling_markdown_tables_at_end,
     docling_plain_text_inline_tables,
@@ -400,6 +402,20 @@ def test_document_local_extraction_failure_is_skipped() -> None:
     output = process_fetched_docx(
         fetched_docx_record(_fetched(_docx_payload())),
         extractor=_Extractor("  \n"),
+        maximum_zip_entries=10,
+        maximum_uncompressed_bytes=1024,
+    )
+
+    assert output is None
+
+
+def test_document_hierarchy_validation_failure_is_skipped() -> None:
+    def extract_with_invalid_hierarchy(_payload: bytes) -> ExtractedDocument:
+        return TypeAdapter(ExtractedDocument).validate_python({"invalid": "document hierarchy"})
+
+    output = process_fetched_docx(
+        fetched_docx_record(_fetched(_docx_payload())),
+        extractor=ExtractionMethod("docling-validation-failure", "v1", extract_with_invalid_hierarchy),
         maximum_zip_entries=10,
         maximum_uncompressed_bytes=1024,
     )

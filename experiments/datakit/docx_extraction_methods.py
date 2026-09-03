@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
+from pydantic import ValidationError
+
 from marin.datakit.download.common_crawl_docx import (
     DOCLING_IMAGE_PLACEHOLDER,
     DoclingDocxExtractor,
@@ -45,7 +47,10 @@ class ExtractionMethod:
         return f"{self.name}-{self.revision}-{DoclingDocxExtractor().identity}"
 
     def extract(self, payload: bytes) -> ExtractedDocument:
-        return self.function(payload)
+        try:
+            return self.function(payload)
+        except ValidationError as error:
+            raise DocxExtractionError("Docling produced an invalid document hierarchy") from error
 
 
 def docling_default(payload: bytes) -> ExtractedDocument:
