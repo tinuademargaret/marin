@@ -1172,7 +1172,7 @@ class LmEvalHarnessConfig:
 
         task_name = task if isinstance(task, str) else task["task"]
 
-        if isinstance(task, dict) and self._is_registered_task_override(task):
+        if isinstance(task, dict) and task_name in manager.all_tasks:
             task_dict = _call_with_retry(lambda: tasks.get_task_dict(task_name, manager))
             self._apply_registered_task_overrides(task_dict, task)
         else:
@@ -1184,20 +1184,6 @@ class LmEvalHarnessConfig:
             logger.exception(f"Failed to rename task {task}: {task_dict}")
             raise ValueError(f"Failed to rename task {task}: {task_dict}")
         return this_task
-
-    @staticmethod
-    def _is_registered_task_override(task: dict) -> bool:
-        inline_task_fields = {
-            "dataset_path",
-            "dataset_name",
-            "output_type",
-            "test_split",
-            "training_split",
-            "validation_split",
-            "fewshot_split",
-            "metric_list",
-        }
-        return not inline_task_fields.intersection(task)
 
     def _apply_registered_task_overrides(self, task_dict: dict, overrides: dict) -> None:
         from lm_eval.api.task import ConfigurableTask  # noqa: PLC0415  # optional dep: lm_eval

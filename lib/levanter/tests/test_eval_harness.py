@@ -188,7 +188,7 @@ def test_task_config():
 @skip_if_module_missing("lm_eval")
 def test_registered_task_accepts_fewshot_override():
     config = LmEvalHarnessConfig(
-        task_spec=[TaskConfig(task="boolq", num_fewshot=10)],
+        task_spec=[TaskConfig(task="boolq", num_fewshot=10, dataset_path="aps/super_glue")],
     )
 
     task_dict = config.to_task_dict()
@@ -196,3 +196,4 @@ def test_registered_task_accepts_fewshot_override():
     assert len(task_dict) == 1
     task = next(iter(task_dict.values()))
     assert task.config.num_fewshot == 10
+    assert task.config.dataset_path == "aps/super_glue"
