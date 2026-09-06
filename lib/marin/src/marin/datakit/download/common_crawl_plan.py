@@ -416,6 +416,7 @@ def discover_common_crawl(
         name="common-crawl-discovery",
         resources=options.worker_resources,
         max_workers=max(1, min(options.max_workers, len(requests))),
+        chunk_storage_prefix=prefix_join(output_path, "_zephyr"),
     ).execute(pipeline)
     return CommonCrawlDiscoverySummary(
         manifest_path=records_dir,

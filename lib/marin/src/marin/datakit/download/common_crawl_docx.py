@@ -503,6 +503,7 @@ def fetch_common_crawl_docx(
         name=f"common-crawl-docx-fetch-{config.name}",
         resources=ResourceConfig(cpu=1, ram="8g"),
         max_workers=max(1, min(config.max_workers, len(tasks))),
+        chunk_storage_prefix=prefix_join(output_path, "_zephyr"),
     ).execute(pipeline)
     return CommonCrawlDocxStageResult(
         data_dir=prefix_join(output_path, "data"),
