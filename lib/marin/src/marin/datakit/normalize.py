@@ -427,18 +427,58 @@ def normalize_to_parquet(
         A :class:`NormalizedData` describing the output directories and
         aggregated zephyr counters.
     """
-    resources = worker_resources or ResourceConfig(cpu=2, ram="32g", disk="10g")
+    return normalize_paths_to_parquet(
+        input_paths=(input_path,),
+        output_path=output_path,
+        text_field=text_field,
+        id_field=id_field,
+        target_partition_bytes=target_partition_bytes,
+        max_whitespace_run_chars=max_whitespace_run_chars,
+        worker_resources=worker_resources,
+        max_workers=max_workers,
+        file_extensions=file_extensions,
+        dedup_mode=dedup_mode,
+        bare=bare,
+        output_schema=output_schema,
+    )
 
-    files = _discover_files(input_path, file_extensions=file_extensions)
+
+def normalize_paths_to_parquet(
+    *,
+    input_paths: tuple[str, ...],
+    output_path: str,
+    text_field: str = "text",
+    id_field: str = "id",
+    target_partition_bytes: int = 256 * 1024 * 1024,
+    max_whitespace_run_chars: int = DEFAULT_MAX_WHITESPACE_RUN_CHARS,
+    worker_resources: ResourceConfig | None = None,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    file_extensions: tuple[str, ...] | None = None,
+    dedup_mode: DedupMode = DedupMode.EXACT,
+    bare: bool = False,
+    output_schema: pa.Schema | None = None,
+) -> NormalizedData:
+    """Normalize files from multiple input roots as one dataset."""
+    if not input_paths:
+        raise ValueError("input_paths must not be empty")
+
+    resources = worker_resources or ResourceConfig(cpu=2, ram="32g", disk="10g")
+    files = sorted(
+        {
+            file_path
+            for input_path in input_paths
+            for file_path in _discover_files(input_path, file_extensions=file_extensions)
+        }
+    )
     if not files:
-        raise FileNotFoundError(f"No data files found under {input_path}")
+        raise FileNotFoundError(f"No data files found under {input_paths}")
 
     total_bytes = _compute_total_bytes(files)
     num_shards = max(1, total_bytes // target_partition_bytes)
 
     logger.info(
         "Normalizing %s → %s: %d files, %d bytes, %d shards",
-        input_path,
+        input_paths,
         output_path,
         len(files),
         total_bytes,
@@ -478,6 +518,63 @@ def normalize_to_parquet(
         main_output_dir=prefix_join(output_path, "outputs/main"),
         dup_output_dir=prefix_join(output_path, "outputs/dups"),
         counters=counters_dict,
+    )
+
+
+def normalize_paths_step(
+    *,
+    name: str,
+    downloads: tuple[StepSpec, ...],
+    input_paths: tuple[str, ...],
+    text_field: str = "text",
+    id_field: str = "id",
+    target_partition_bytes: int = 256 * 1024 * 1024,
+    max_whitespace_run_chars: int = DEFAULT_MAX_WHITESPACE_RUN_CHARS,
+    worker_resources: ResourceConfig | None = None,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    output_path_prefix: str | None = None,
+    file_extensions: tuple[str, ...] | None = None,
+    dedup_mode: DedupMode = DedupMode.EXACT,
+    bare: bool = False,
+    output_schema: pa.Schema | None = None,
+) -> StepSpec:
+    """Create one normalization step over several materialized input roots."""
+    if not downloads:
+        raise ValueError("downloads must not be empty")
+    if not input_paths:
+        raise ValueError("input_paths must not be empty")
+    hash_attrs: dict[str, Any] = {
+        "text_field": text_field,
+        "id_field": id_field,
+        "target_partition_bytes": target_partition_bytes,
+        "max_whitespace_run_chars": max_whitespace_run_chars,
+        "input_paths": input_paths,
+        "file_extensions": file_extensions,
+        "dedup_mode": dedup_mode,
+    }
+    if bare:
+        hash_attrs["bare"] = bare
+    if output_schema is not None:
+        hash_attrs["output_schema"] = str(output_schema)
+    return StepSpec(
+        name=name,
+        fn=lambda output_path: normalize_paths_to_parquet(
+            input_paths=input_paths,
+            output_path=output_path,
+            text_field=text_field,
+            id_field=id_field,
+            target_partition_bytes=target_partition_bytes,
+            max_whitespace_run_chars=max_whitespace_run_chars,
+            worker_resources=worker_resources,
+            max_workers=max_workers,
+            file_extensions=file_extensions,
+            dedup_mode=dedup_mode,
+            bare=bare,
+            output_schema=output_schema,
+        ),
+        deps=list(downloads),
+        hash_attrs=hash_attrs,
+        output_path_prefix=output_path_prefix,
     )
 
 

@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 import pytest
 from fray.current_client import set_current_client
 from fray.local_backend import LocalClient
-from marin.datakit.normalize import generate_id, normalize_to_parquet
+from marin.datakit.normalize import generate_id, normalize_paths_to_parquet, normalize_to_parquet
 
 
 @pytest.fixture(autouse=True)
@@ -225,6 +225,25 @@ def test_subdirectories_merged_into_single_output(tmp_path: Path, write_jsonl_gz
 
     assert result.main_output_dir == str(output_dir / "outputs" / "main")
     assert {r["text"] for r in _read_all_parquet(output_dir)} == {"A doc", "B doc"}
+
+
+def test_multiple_input_roots_are_normalized_and_deduplicated_together(tmp_path: Path, write_jsonl_gz):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    output_dir = tmp_path / "output"
+    write_jsonl_gz(first / "data.jsonl.gz", [{"text": "shared"}, {"text": "first only"}])
+    write_jsonl_gz(second / "data.jsonl.gz", [{"text": "shared"}, {"text": "second only"}])
+
+    normalize_paths_to_parquet(
+        input_paths=(str(first), str(second)),
+        output_path=str(output_dir),
+    )
+
+    assert {record["text"] for record in _read_all_parquet(output_dir)} == {
+        "shared",
+        "first only",
+        "second only",
+    }
 
 
 def test_exact_dedup(tmp_path: Path, write_jsonl_gz):
