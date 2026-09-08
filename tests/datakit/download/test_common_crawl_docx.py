@@ -72,6 +72,18 @@ def _real_docx_payload(text: str) -> bytes:
     return output.getvalue()
 
 
+def _docx_with_malformed_document_xml() -> bytes:
+    source = io.BytesIO(_real_docx_payload("replace me"))
+    output = io.BytesIO()
+    with zipfile.ZipFile(source) as source_archive, zipfile.ZipFile(output, "w") as output_archive:
+        for member in source_archive.infolist():
+            payload = source_archive.read(member)
+            if member.filename == "word/document.xml":
+                payload = payload.replace(b"replace me", b"invalid & entity")
+            output_archive.writestr(member, payload)
+    return output.getvalue()
+
+
 def _real_docx_with_table() -> bytes:
     output = io.BytesIO()
     document = Document()
@@ -266,6 +278,11 @@ def test_docling_extractor_reads_real_docx_fixture() -> None:
 
     assert "Common Crawl DOCX" in extracted.text
     assert "A small document extracted by Docling." in extracted.text
+
+
+def test_docling_extractor_wraps_malformed_ooxml_as_document_failure() -> None:
+    with pytest.raises(DocxExtractionError, match="Docling failed"):
+        DoclingDocxExtractor().extract(_docx_with_malformed_document_xml())
 
 
 def test_docling_extractor_preserves_table_text_without_markdown_padding() -> None:
