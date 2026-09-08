@@ -22,6 +22,8 @@ from marin.evaluation.evaluation_config import EvalTaskConfig
 from marin.evaluation.serving_config import _auto_serve_overrides_from_config, auto_serve_overrides
 from marin.inference.types import OpenAIEndpoint, RunningModel
 
+from experiments.evals.evals import wikitablequestions_eval
+
 _MODEL = RunningModel(
     endpoint=OpenAIEndpoint(
         base_url="http://10.0.0.1:30000/v1",
@@ -86,6 +88,22 @@ def test_task_dirs_distinguish_shot_variants_of_one_task():
 
     assert [t["name"] for t in tasks] == ["hellaswag", "hellaswag"]
     assert [t["dir"] for t in tasks] == ["hellaswag_0shot", "hellaswag_10shot"]
+
+
+def test_wikitablequestions_eval_uses_generation_with_a_short_answer_budget():
+    group = wikitablequestions_eval(max_eval_instances=7)[0]
+
+    assert group.config.name == "wikitablequestions"
+    assert group.config.max_gen_toks == 64
+    assert group.config.max_eval_instances == 7
+    assert group.config.tasks == (
+        EvalTaskConfig(
+            "wikitablequestions",
+            0,
+            task_alias="wikitablequestions_0shot",
+            generation=True,
+        ),
+    )
 
 
 def test_build_command_completion_route_with_fewshot_and_limit():

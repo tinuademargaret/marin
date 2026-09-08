@@ -33,7 +33,7 @@ from marin.experiment.data import tokenized
 from marin.experiment.evaluation import EvalReport, eval_report, eval_steps
 from marin.experiment.train import EvalSuite, train_lm
 
-from experiments.evals.evals import core_evals
+from experiments.evals.evals import core_evals, wikitablequestions_eval
 from experiments.evals.task_configs import CORE_TASKS
 from experiments.llama import llama_30m, llama_150m
 from experiments.marin_tokenizer import marin_tokenizer
@@ -133,7 +133,11 @@ def build(
             tags=("docx", "extraction-ablation", variant.name, model_size),
         )
         evaluation_groups = tuple(
-            replace(group, discover_latest_checkpoint=False) for group in core_evals(accelerator=evaluation_accelerator)
+            replace(group, discover_latest_checkpoint=False)
+            for group in (
+                *core_evals(accelerator=evaluation_accelerator),
+                *wikitablequestions_eval(accelerator=evaluation_accelerator),
+            )
         )
         results = eval_steps(checkpoint, evaluation_groups)
         reports[variant.name] = eval_report(

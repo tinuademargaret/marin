@@ -37,6 +37,12 @@ CORE_TASKS = (
 MMLU_0_SHOT = EvalTaskConfig("mmlu", 0, task_alias="mmlu_0shot")
 MMLU_5_SHOT = EvalTaskConfig("mmlu", 5, task_alias="mmlu_5shot")
 MMLU_PRO_5_SHOT = EvalTaskConfig("leaderboard_mmlu_pro", 5, task_alias="mmlu_pro_5shot")
+WIKITABLEQUESTIONS_0_SHOT = EvalTaskConfig(
+    "wikitablequestions",
+    0,
+    task_alias="wikitablequestions_0shot",
+    generation=True,
+)
 
 OPEN_LM_LEADERBOARD_MCQ = (
     EvalTaskConfig("leaderboard_bbh", 3, task_alias="lb_bbh_3shot"),

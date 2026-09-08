@@ -17,6 +17,7 @@ from experiments.evals.task_configs import (
     MMLU_0_SHOT,
     MMLU_5_SHOT,
     MMLU_PRO_5_SHOT,
+    WIKITABLEQUESTIONS_0_SHOT,
 )
 
 
@@ -32,6 +33,26 @@ def core_evals(
     return [
         EvalGroup(
             config=EvalchemyRunConfig(name="core", tasks=CORE_TASKS),
+            serve=serve or ServeConfig(),
+            accelerator=_default_accelerator(accelerator),
+        )
+    ]
+
+
+def wikitablequestions_eval(
+    serve: ServeConfig | None = None,
+    accelerator: AcceleratorChoice | None = None,
+    max_eval_instances: int | None = None,
+) -> list[EvalGroup]:
+    """WikiTableQuestions generation evaluation over grid-formatted tables."""
+    return [
+        EvalGroup(
+            config=EvalchemyRunConfig(
+                name="wikitablequestions",
+                tasks=(WIKITABLEQUESTIONS_0_SHOT,),
+                max_gen_toks=64,
+                max_eval_instances=max_eval_instances,
+            ),
             serve=serve or ServeConfig(),
             accelerator=_default_accelerator(accelerator),
         )
