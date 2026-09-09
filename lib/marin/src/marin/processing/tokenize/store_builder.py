@@ -182,6 +182,7 @@ def build_from_datasets(
         shard_cache_paths=shard_paths,
         output_path=output_path,
         exemplar=exemplar,
+        chunk_storage_prefix=ctx.chunk_storage_prefix,
     )
     consolidate_elapsed = time.monotonic() - consolidate_start
 

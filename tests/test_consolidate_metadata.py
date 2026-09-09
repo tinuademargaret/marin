@@ -56,7 +56,9 @@ def test_consolidate_shard_cache_ledgers_writes_only_ledger():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        ledger = consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        ledger = consolidate_shard_cache_ledgers(
+            shard_paths, tmpdir, EXEMPLAR_FLAT, chunk_storage_prefix=os.path.join(tmpdir, "_zephyr")
+        )
 
         assert ledger.layout == CACHE_LAYOUT_SHARDED
         assert ledger.total_num_rows == NUM_SHARDS * ROWS_PER_SHARD
@@ -136,7 +138,12 @@ async def test_consolidate_external_shards_rejected():
             shard_paths.append(shard_path)
 
         with pytest.raises(ValueError, match="not under output path"):
-            consolidate_shard_cache_ledgers(shard_paths, output_path, EXEMPLAR_FLAT)
+            consolidate_shard_cache_ledgers(
+                shard_paths,
+                output_path,
+                EXEMPLAR_FLAT,
+                chunk_storage_prefix=os.path.join(tmpdir, "_zephyr"),
+            )
 
 
 def test_sharded_cache_rejects_duplicate_shards():
@@ -221,7 +228,9 @@ async def test_token_seq_dataset_reads_sharded_cache():
             for row_index in range(ROWS_PER_SHARD):
                 all_tokens.extend(np.arange(ROW_WIDTH, dtype=np.int32) + i * 100 + row_index * 10)
 
-        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        consolidate_shard_cache_ledgers(
+            shard_paths, tmpdir, EXEMPLAR_FLAT, chunk_storage_prefix=os.path.join(tmpdir, "_zephyr")
+        )
         cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
         dataset = TokenSeqDataset(cache, SEQ_LEN)
 
@@ -243,7 +252,9 @@ async def test_greedy_prepacked_dataset_reads_sharded_cache():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        consolidate_shard_cache_ledgers(
+            shard_paths, tmpdir, EXEMPLAR_FLAT, chunk_storage_prefix=os.path.join(tmpdir, "_zephyr")
+        )
         cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
         packed = GreedyPrepackedDataset(
             cache.jagged_array_tree(),
@@ -293,7 +304,9 @@ async def test_tree_cache_get_batch_reads_sharded_rows():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        consolidate_shard_cache_ledgers(
+            shard_paths, tmpdir, EXEMPLAR_FLAT, chunk_storage_prefix=os.path.join(tmpdir, "_zephyr")
+        )
         cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
 
         batch = await cache.get_batch([0, ROWS_PER_SHARD, NUM_SHARDS * ROWS_PER_SHARD - 1])
@@ -315,7 +328,9 @@ async def test_tree_cache_get_batch_slice_uses_python_slice_semantics():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        consolidate_shard_cache_ledgers(
+            shard_paths, tmpdir, EXEMPLAR_FLAT, chunk_storage_prefix=os.path.join(tmpdir, "_zephyr")
+        )
         cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
 
         assert await cache.get_batch(slice(0, 0)) == []
@@ -331,7 +346,9 @@ def test_tree_cache_get_batch_sync_slice_uses_python_slice_semantics():
             _build_shard_cache(shard_path, i)
             shard_paths.append(shard_path)
 
-        consolidate_shard_cache_ledgers(shard_paths, tmpdir, EXEMPLAR_FLAT)
+        consolidate_shard_cache_ledgers(
+            shard_paths, tmpdir, EXEMPLAR_FLAT, chunk_storage_prefix=os.path.join(tmpdir, "_zephyr")
+        )
         cache = TreeCache.load(tmpdir, EXEMPLAR_FLAT)
 
         assert cache.get_batch_sync(slice(0, 0)) == []

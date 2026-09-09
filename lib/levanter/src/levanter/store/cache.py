@@ -1152,6 +1152,7 @@ def consolidate_shard_cache_ledgers(
     shard_cache_paths: List[str],
     output_path: str,
     exemplar,
+    chunk_storage_prefix: str,
     metadata: Optional[CacheMetadata] = None,
 ) -> CacheLedger:
     """
@@ -1159,6 +1160,13 @@ def consolidate_shard_cache_ledgers(
 
     Shard directories must be under output_path. The output ledger stores their
     relative paths instead of copying their arrays into a top-level TreeStore.
+
+    Args:
+        shard_cache_paths: Shard cache directories to consolidate.
+        output_path: Destination for the consolidated ledger.
+        exemplar: Tree structure and dtypes stored in each shard.
+        chunk_storage_prefix: Storage prefix for the consolidation probe's intermediate chunks.
+        metadata: Metadata for the consolidated cache.
     """
     if metadata is None:
         metadata = CacheMetadata.empty()
@@ -1200,6 +1208,7 @@ def consolidate_shard_cache_ledgers(
         resources=ResourceConfig(ram="5g", cpu=2),
         max_workers=min(CONSOLIDATE_DATA_SIZE_WORKERS, len(shard_cache_paths)),
         name="levanter-cache-probe",
+        chunk_storage_prefix=chunk_storage_prefix,
     )
     probe_results = probe_ctx.execute(
         Dataset.from_list(shard_cache_paths).map(_probe_shard),
