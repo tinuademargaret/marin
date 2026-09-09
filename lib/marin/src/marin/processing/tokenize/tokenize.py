@@ -320,6 +320,7 @@ def _run_split(
         map_task_resources=config.map_task_resources,
         max_workers=min(config.max_workers, len(file_groups)),
         name=f"tokenize-{split_name}",
+        chunk_storage_prefix=prefix_join(config.cache_path, "_zephyr"),
     )
     # Broadcast tokenizer config to workers. We send name + backend rather than
     # the tokenizer object because not all backends support pickling.
