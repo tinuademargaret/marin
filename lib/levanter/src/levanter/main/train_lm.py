@@ -91,6 +91,7 @@ class TrainLmConfig:
     """
     eval_harness: Optional[LmEvalHarnessConfig] = None
     eval_harness_steps: int = 10000
+    run_initial_harness_eval: bool = False
     labeled_eval: LabeledLmEvalConfig | None = None
 
     # TODO: really need to add callback framework
@@ -414,12 +415,14 @@ def main(config: TrainLmConfig):
             ),
         )
 
+        eval_harness_callback = None
         if config.eval_harness is not None:
             eval_harness = config.eval_harness
+            eval_harness_callback = levanter.eval_harness.lm_eval_harness(
+                eval_harness, tokenizer, EvalBatch, compute_axis_mapping, trainer.mp
+            )
             trainer.add_hook(
-                levanter.eval_harness.lm_eval_harness(
-                    eval_harness, tokenizer, EvalBatch, compute_axis_mapping, trainer.mp
-                ),
+                eval_harness_callback,
                 every=config.eval_harness_steps,
             )
 
@@ -453,6 +456,9 @@ def main(config: TrainLmConfig):
             train_loader = train_loader.iter_from_step(state.step)
         else:
             train_loader = train_loader.iter_from_step(0)
+
+        if config.run_initial_harness_eval and eval_harness_callback is not None and state.step == 0:
+            eval_harness_callback(callbacks.StepInfo(state, 0.0, 0.0), force=True)
 
         ## OK, actually run training!
         trainer.train(state, train_loader)

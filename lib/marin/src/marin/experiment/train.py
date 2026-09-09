@@ -71,6 +71,8 @@ class EvalSuite:
 
     tasks: tuple[EvalTaskConfig, ...]
     every: int
+    max_examples: int | None = None
+    run_initial: bool = False
 
 
 def _marin_mesh(tensor_parallel_size: int) -> MeshConfig:
@@ -170,7 +172,12 @@ def train_lm(
             )
 
     harness = (
-        LmEvalHarnessConfig(task_spec=convert_to_levanter_task_config(list(evals.tasks))) if evals is not None else None
+        LmEvalHarnessConfig(
+            task_spec=convert_to_levanter_task_config(list(evals.tasks)),
+            max_examples=evals.max_examples,
+        )
+        if evals is not None
+        else None
     )
     all_deps = (*datasets, *validation, *((init_from,) if init_from is not None else ()))
 
@@ -226,6 +233,7 @@ def train_lm(
             initialize_from_checkpoint_path=init_path,
             eval_harness=harness,
             eval_harness_steps=evals.every if evals is not None else None,
+            run_initial_harness_eval=evals.run_initial if evals is not None else False,
             adapter=NoAdaptorConfig(),
         )
         return TrainLmOnPodConfig(

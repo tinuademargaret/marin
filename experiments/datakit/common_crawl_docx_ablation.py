@@ -25,10 +25,12 @@ from dataclasses import replace
 import click
 from fray.types import ResourceConfig
 from levanter.optim.config import AdamConfig
+from marin.evaluation.evalchemy.runner import EvalchemyRunConfig
+from marin.evaluation.evaluation_config import EvalTaskConfig
 from marin.evaluation.hardware import AcceleratorChoice, Platform
 from marin.execution.lazy import ArtifactStep
 from marin.experiment.cli import build_options
-from marin.experiment.evaluation import EvalReport, eval_report, eval_steps
+from marin.experiment.evaluation import EvalGroup, EvalReport, eval_report, eval_steps
 from marin.experiment.train import EvalSuite, train_lm
 
 from experiments.datasets.docx_extraction_ablation import (
@@ -36,11 +38,16 @@ from experiments.datasets.docx_extraction_ablation import (
     docx_extraction_datasets,
     normalized_variants,
 )
-from experiments.evals.evals import core_evals, wikitablequestions_eval
-from experiments.evals.task_configs import CORE_TASKS
+from experiments.evals.evals import wikitablequestions_eval
+from experiments.evals.task_configs import WIKITABLEQUESTIONS_0_SHOT
 from experiments.llama import llama_30m, llama_150m
 
 MODELS = {"30m": llama_30m, "150m": llama_150m}
+ABLATION_BENCHMARK_TASKS = (
+    EvalTaskConfig("lambada_openai", 0),
+    EvalTaskConfig("hellaswag", 0, task_alias="hellaswag_0shot"),
+    EvalTaskConfig("arc_easy", 10),
+)
 
 
 def build(
@@ -53,6 +60,9 @@ def build(
     batch_size: int,
     train_steps: int,
     evaluation_every: int,
+    benchmark_every: int,
+    benchmark_max_examples: int,
+    wikitablequestions_max_examples: int,
     wandb_entity: str,
     wandb_project: str,
     wandb_group: str,
@@ -87,7 +97,12 @@ def build(
             seq_len=model.max_seq_len,
             num_train_steps=train_steps,
             z_loss_weight=None,
-            evals=EvalSuite(CORE_TASKS, every=evaluation_every),
+            evals=EvalSuite(
+                (*ABLATION_BENCHMARK_TASKS, WIKITABLEQUESTIONS_0_SHOT),
+                every=benchmark_every,
+                max_examples=benchmark_max_examples,
+                run_initial=True,
+            ),
             steps_per_eval=evaluation_every,
             resources=training_resources,
             wandb_entity=wandb_entity,
@@ -96,11 +111,18 @@ def build(
             wandb_mode="online",
             tags=("docx", "extraction-ablation", variant.name, model_size),
         )
+        selected_benchmarks = EvalGroup(
+            config=EvalchemyRunConfig(name="docx-selected", tasks=ABLATION_BENCHMARK_TASKS),
+            accelerator=evaluation_accelerator,
+        )
         evaluation_groups = tuple(
             replace(group, discover_latest_checkpoint=False)
             for group in (
-                *core_evals(accelerator=evaluation_accelerator),
-                *wikitablequestions_eval(accelerator=evaluation_accelerator),
+                selected_benchmarks,
+                *wikitablequestions_eval(
+                    accelerator=evaluation_accelerator,
+                    max_eval_instances=wikitablequestions_max_examples,
+                ),
             )
         )
         results = eval_steps(checkpoint, evaluation_groups)
@@ -127,6 +149,9 @@ def build(
 @click.option("--batch-size", type=click.IntRange(min=1), required=True)
 @click.option("--train-steps", type=click.IntRange(min=1), required=True)
 @click.option("--evaluation-every", type=click.IntRange(min=1), required=True)
+@click.option("--benchmark-every", type=click.IntRange(min=1), required=True)
+@click.option("--benchmark-max-examples", type=click.IntRange(min=1), default=1000, show_default=True)
+@click.option("--wikitablequestions-max-examples", type=click.IntRange(min=1), default=1000, show_default=True)
 @click.option("--wandb-entity", required=True, help="W&B user or team that owns the project.")
 @click.option("--wandb-project", required=True, help="W&B project receiving all treatment runs.")
 @click.option("--wandb-group", required=True, help="Shared W&B group for this extraction comparison.")
@@ -140,6 +165,9 @@ def main(
     batch_size: int,
     train_steps: int,
     evaluation_every: int,
+    benchmark_every: int,
+    benchmark_max_examples: int,
+    wikitablequestions_max_examples: int,
     wandb_entity: str,
     wandb_project: str,
     wandb_group: str,
@@ -153,6 +181,9 @@ def main(
         batch_size=batch_size,
         train_steps=train_steps,
         evaluation_every=evaluation_every,
+        benchmark_every=benchmark_every,
+        benchmark_max_examples=benchmark_max_examples,
+        wikitablequestions_max_examples=wikitablequestions_max_examples,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
         wandb_group=wandb_group,

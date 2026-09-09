@@ -146,9 +146,17 @@ def test_evals_none_means_no_harness(tmp_path):
 
 def test_eval_suite_wires_a_harness(tmp_path):
     corpus = _corpus()
-    tc = _assemble(_build(datasets={corpus: 1.0}, evals=EvalSuite(CORE_TASKS, every=2000)), str(tmp_path)).train_config
+    tc = _assemble(
+        _build(
+            datasets={corpus: 1.0},
+            evals=EvalSuite(CORE_TASKS, every=2000, max_examples=500, run_initial=True),
+        ),
+        str(tmp_path),
+    ).train_config
     assert tc.eval_harness is not None
     assert tc.eval_harness_steps == 2000
+    assert tc.eval_harness.max_examples == 500
+    assert tc.run_initial_harness_eval
 
 
 def test_init_from_chains_the_parent(tmp_path):
