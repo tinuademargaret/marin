@@ -20,8 +20,7 @@ independently; intersect ``source_id`` values first when the experiment must com
 representations over exactly the same documents rather than end-to-end pipeline yield.
 """
 
-import re
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import click
 from fray.types import ResourceConfig
@@ -29,46 +28,19 @@ from levanter.optim.config import AdamConfig
 from marin.evaluation.hardware import AcceleratorChoice, Platform
 from marin.execution.lazy import ArtifactStep
 from marin.experiment.cli import build_options
-from marin.experiment.data import tokenized
 from marin.experiment.evaluation import EvalReport, eval_report, eval_steps
 from marin.experiment.train import EvalSuite, train_lm
 
+from experiments.datasets.docx_extraction_ablation import (
+    NormalizedVariant,
+    docx_extraction_datasets,
+    normalized_variants,
+)
 from experiments.evals.evals import core_evals, wikitablequestions_eval
 from experiments.evals.task_configs import CORE_TASKS
 from experiments.llama import llama_30m, llama_150m
-from experiments.marin_tokenizer import marin_tokenizer
 
 MODELS = {"30m": llama_30m, "150m": llama_150m}
-_VARIANT_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-
-
-@dataclass(frozen=True)
-class NormalizedVariant:
-    """One extraction treatment and its normalized Parquet directory."""
-
-    name: str
-    path: str
-
-    def __post_init__(self) -> None:
-        if _VARIANT_NAME.fullmatch(self.name) is None:
-            raise ValueError(f"Invalid extraction method name: {self.name!r}")
-
-
-def normalized_variants(values: tuple[str, ...]) -> tuple[NormalizedVariant, ...]:
-    """Parse repeated ``METHOD=GCS_PATH`` arguments into unique treatments."""
-    variants: list[NormalizedVariant] = []
-    for value in values:
-        name, separator, path = value.partition("=")
-        if not separator or not name or not path.startswith("gs://"):
-            raise click.BadParameter(f"{value!r} must have the form METHOD=gs://BUCKET/PATH")
-        try:
-            variants.append(NormalizedVariant(name=name, path=path.rstrip("/")))
-        except ValueError as error:
-            raise click.BadParameter(str(error)) from error
-    names = [variant.name for variant in variants]
-    if len(set(names)) != len(names):
-        raise click.BadParameter("Each extraction method may be specified only once")
-    return tuple(variants)
 
 
 def build(
@@ -102,17 +74,9 @@ def build(
         region=region,
     )
     reports: dict[str, ArtifactStep[EvalReport]] = {}
-    tokenization_resources = ResourceConfig.with_cpu(cpu=1, disk="32G", ram="10G", regions=[region])
+    datasets = docx_extraction_datasets(variants, region=region)
     for variant in variants:
-        dataset = tokenized(
-            f"tokenized/docx-extraction-ablation/{variant.name}",
-            tokenizer=marin_tokenizer,
-            paths=(f"{variant.path}/**/*.parquet",),
-            text_key="text",
-            tags=("docx", "extraction-ablation", variant.name),
-            resources=tokenization_resources,
-            worker_resources=tokenization_resources,
-        )
+        dataset = datasets[variant.name]
         checkpoint = train_lm(
             name=f"checkpoints/docx-extraction-ablation/{model_size}/{variant.name}",
             run_id=f"docx-{model_size}-{variant.name}",
