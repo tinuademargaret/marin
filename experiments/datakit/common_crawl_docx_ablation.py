@@ -39,8 +39,8 @@ from experiments.datasets.docx_extraction_ablation import (
     normalized_variants,
 )
 from experiments.evals.evals import wikitablequestions_eval
-from experiments.evals.task_configs import WIKITABLEQUESTIONS_0_SHOT
 from experiments.llama import llama_30m, llama_150m
+from experiments.marin_tokenizer import marin_tokenizer
 
 MODELS = {"30m": llama_30m, "150m": llama_150m}
 ABLATION_BENCHMARK_TASKS = (
@@ -116,7 +116,7 @@ def build(
             accelerator=evaluation_accelerator,
         )
         evaluation_groups = tuple(
-            replace(group, discover_latest_checkpoint=False)
+            replace(group, discover_latest_checkpoint=False, tokenizer=marin_tokenizer)
             for group in (
                 selected_benchmarks,
                 *wikitablequestions_eval(
