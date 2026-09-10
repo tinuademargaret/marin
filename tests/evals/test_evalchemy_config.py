@@ -19,8 +19,13 @@ from marin.evaluation.evalchemy.runner import (
     _run_config_json,
 )
 from marin.evaluation.evaluation_config import EvalTaskConfig
+from marin.evaluation.hardware import AcceleratorChoice, Platform
+from marin.evaluation.model_config import ResourceHint, ServeConfig
 from marin.evaluation.serving_config import _auto_serve_overrides_from_config, auto_serve_overrides
+from marin.execution.lazy import ArtifactStep
+from marin.experiment.evaluation import evaluate_evalchemy
 from marin.inference.types import OpenAIEndpoint, RunningModel
+from marin.training.training import LevanterCheckpoint
 
 from experiments.evals.evals import wikitablequestions_eval
 
@@ -44,6 +49,29 @@ def _config(**overrides) -> EvalchemyRunConfig:
 
 def _payload(config: EvalchemyRunConfig | None = None) -> dict:
     return json.loads(_run_config_json(_MODEL, config or _config(), "gs://bucket/evals/qwen3/core"))
+
+
+def test_evalchemy_checkpoint_discovery_is_deferred_until_after_dependency_completion():
+    checkpoint = ArtifactStep(
+        name="checkpoints/model",
+        version="2026.09.10",
+        artifact_type=LevanterCheckpoint,
+        run=lambda _config: None,
+        build_config=lambda ctx: {"output_path": ctx.output_path},
+    )
+    evaluation = evaluate_evalchemy(
+        model_name="model",
+        model=checkpoint,
+        config=_config(),
+        serve=ServeConfig(),
+        resource_hint=ResourceHint(),
+        accelerator=AcceleratorChoice(platform=Platform.GPU, gpu_type="H100", gpu_count=1),
+        tokenizer="marin-community/marin-tokenizer",
+        version="2026.09.10",
+    )
+
+    # Lowering must remain pure: the dependency's HF export does not exist until the training step runs.
+    assert evaluation.fingerprint()
 
 
 def test_client_config_json_carries_endpoint_and_per_task_dirs():

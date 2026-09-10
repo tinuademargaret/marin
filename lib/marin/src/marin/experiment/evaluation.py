@@ -54,6 +54,7 @@ class EvalchemyEvalConfig:
     accelerator: AcceleratorChoice
     run: EvalchemyRunConfig
     out_path: str | None = None
+    discover_latest_checkpoint: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,11 +94,17 @@ def run_served_evalchemy(config: EvalchemyEvalConfig) -> ServedEvalchemyRun:
     if not config.run.tasks:
         raise ValueError("Evalchemy requires at least one task")
     output_dir = _durable_output_dir(config.out_path, uuid.uuid4().hex[:8])
-    if config.model.tokenizer is None and "://" in config.model.location:
-        raise ValueError(f"model {config.model.location!r} is an object-store path; set tokenizer to an HF tokenizer id")
+    model = config.model
+    if config.discover_latest_checkpoint:
+        checkpoints = discover_hf_checkpoints(model.location)
+        if not checkpoints:
+            raise FileNotFoundError(f"no Hugging Face checkpoints found under {model.location!r}")
+        model = replace(model, location=checkpoints[-1])
+    if model.tokenizer is None and "://" in model.location:
+        raise ValueError(f"model {model.location!r} is an object-store path; set tokenizer to an HF tokenizer id")
     runtime_env = env_vars_from_keys(EVAL_RUNTIME_ENV_KEYS)
     inference = inference_config_for_model(
-        config.model,
+        model,
         config.accelerator,
         env_vars=runtime_env,
     )
@@ -145,8 +152,6 @@ def evaluate_evalchemy(
 
     def build_config(ctx: StepContext) -> EvalchemyEvalConfig:
         model_path = ctx.artifact_path(model)
-        if discover_latest_checkpoint:
-            model_path = discover_hf_checkpoints(model_path)[-1]
         return EvalchemyEvalConfig(
             model=ModelConfig(
                 name=model_name,
@@ -158,6 +163,7 @@ def evaluate_evalchemy(
             accelerator=accelerator,
             run=config,
             out_path=ctx.output_path,
+            discover_latest_checkpoint=discover_latest_checkpoint,
         )
 
     return ArtifactStep(
