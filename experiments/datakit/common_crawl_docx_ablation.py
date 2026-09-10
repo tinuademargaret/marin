@@ -98,7 +98,7 @@ def build(
             num_train_steps=train_steps,
             z_loss_weight=None,
             evals=EvalSuite(
-                (*ABLATION_BENCHMARK_TASKS, WIKITABLEQUESTIONS_0_SHOT),
+                ABLATION_BENCHMARK_TASKS,
                 every=benchmark_every,
                 max_examples=benchmark_max_examples,
                 run_initial=True,
