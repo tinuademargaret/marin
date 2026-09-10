@@ -116,7 +116,7 @@ def build(
             accelerator=evaluation_accelerator,
         )
         evaluation_groups = tuple(
-            replace(group, discover_latest_checkpoint=False, tokenizer=marin_tokenizer)
+            replace(group, tokenizer=marin_tokenizer)
             for group in (
                 selected_benchmarks,
                 *wikitablequestions_eval(
