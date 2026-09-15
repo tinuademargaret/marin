@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
+import subprocess
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
 from iris.client import Job, JobFailedError, iris_ctx
 from iris.cluster.types import Entrypoint, EnvironmentSpec, ResourceSpec
@@ -222,6 +225,36 @@ def _run_evalchemy_child(
     return eval_path
 
 
+def _run_local_evalchemy_child(
+    model: RunningModel,
+    config: EvalchemyRunConfig,
+    output_dir: str,
+    env_vars: Mapping[str, str],
+) -> str:
+    child_env = os.environ.copy()
+    child_env.update(
+        _child_env(
+            env_vars,
+            JAX_PLATFORMS="cpu",
+            HF_ALLOW_CODE_EVAL="1",
+            OPENAI_API_KEY="local-endpoint",
+            TQDM_MININTERVAL="30",
+            **{CONFIG_ENV_KEY: _run_config_json(model, config, output_dir)},
+        )
+    )
+    command = (*_evalchemy_client_command(config.runtime), str(Path(__file__).with_name("client.py")))
+    try:
+        subprocess.run(command, check=True, env=child_env)
+    except subprocess.CalledProcessError as exc:
+        raise EvalPipelineError(
+            f"Local Evalchemy process failed with exit code {exc.returncode}",
+            stage=PipelineStage.EVAL,
+            jobs={_EVAL_JOB_ROLE: "local"},
+            log_tails={},
+        ) from exc
+    return "local"
+
+
 def run_evalchemy(
     model: RunningModel,
     config: EvalchemyRunConfig,
@@ -253,6 +286,41 @@ def run_evalchemy(
     )
     return EvalchemyOutcome(
         jobs={_EVAL_JOB_ROLE: eval_job},
+        result=EvalchemyResult(path=output_dir),
+    )
+
+
+def run_local_evalchemy(
+    model: RunningModel,
+    config: EvalchemyRunConfig,
+    output_dir: str,
+    *,
+    env_vars: Mapping[str, str],
+) -> EvalchemyOutcome:
+    """Run Evalchemy as a subprocess on the current host and validate its durable results."""
+    if not config.tasks:
+        raise ValueError("Evalchemy requires at least one task")
+    if "://" not in output_dir:
+        raise ValueError(f"Evalchemy output_dir {output_dir!r} is not an object-store path")
+    eval_process = _run_local_evalchemy_child(model, config, output_dir, env_vars)
+    try:
+        _verify_durable_artifacts(output_dir)
+        parquets = export_lm_eval_samples(output_dir)
+    except Exception as exc:
+        raise EvalPipelineError(
+            str(exc),
+            stage=PipelineStage.ARTIFACTS,
+            jobs={_EVAL_JOB_ROLE: eval_process},
+            log_tails={},
+        ) from exc
+    logger.info(
+        "Local Evalchemy run %s wrote %d sample parquet file(s) under %s",
+        config.name,
+        len(parquets),
+        output_dir,
+    )
+    return EvalchemyOutcome(
+        jobs={_EVAL_JOB_ROLE: eval_process},
         result=EvalchemyResult(path=output_dir),
     )
 

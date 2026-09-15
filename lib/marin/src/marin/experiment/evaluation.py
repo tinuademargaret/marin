@@ -8,9 +8,11 @@ import tempfile
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from typing import cast
 
 from fray.cluster import ResourceConfig
+from iris.cluster.client.job_info import get_job_info
 from rigging.filesystem import StoragePath, marin_prefix, prefix_join
 
 from marin.evaluation.eval_env import EVAL_ENV_KEYS, EVAL_RUNTIME_ENV_KEYS, env_vars_from_keys
@@ -24,6 +26,7 @@ from marin.evaluation.evalchemy.result import (
 from marin.evaluation.evalchemy.runner import (
     EvalchemyRunConfig,
     run_evalchemy,
+    run_local_evalchemy,
 )
 from marin.evaluation.hardware import AcceleratorChoice, Platform
 from marin.evaluation.lm_eval import LM_EVAL_UV_PACKAGES, LmEvalResults, LmEvalRun, run_lm_eval
@@ -36,9 +39,18 @@ from marin.execution.lazy import ArtifactStep, StepContext
 from marin.execution.remote import remote
 from marin.inference.config import RemoteInferenceConfig
 from marin.inference.iris import remote_inference
+from marin.inference.serve import local_inference
 from marin.training.training import LevanterCheckpoint
 
 logger = logging.getLogger(__name__)
+
+
+class EvalchemyExecutionMode(StrEnum):
+    """Where the inference server and Evalchemy client execute."""
+
+    AUTO = "auto"
+    IRIS = "iris"
+    LOCAL = "local"
 
 
 def _orchestrator_resources(accelerator: AcceleratorChoice) -> ResourceConfig:
@@ -53,6 +65,7 @@ class EvalchemyEvalConfig:
     model: ModelConfig
     accelerator: AcceleratorChoice
     run: EvalchemyRunConfig
+    execution: EvalchemyExecutionMode = EvalchemyExecutionMode.AUTO
     out_path: str | None = None
     discover_latest_checkpoint: bool = False
 
@@ -108,15 +121,28 @@ def run_served_evalchemy(config: EvalchemyEvalConfig) -> ServedEvalchemyRun:
         config.accelerator,
         env_vars=runtime_env,
     )
-    with remote_inference(inference) as session:
-        outcome = run_evalchemy(
-            session.model,
-            config.run,
-            output_dir,
-            env_vars=runtime_env,
-        )
-        jobs = {f"serve-{index}" if index else "serve": str(job.job_id) for index, job in enumerate(session.jobs)}
-        jobs |= outcome.jobs
+    execution = config.execution
+    if execution is EvalchemyExecutionMode.AUTO:
+        execution = EvalchemyExecutionMode.IRIS if get_job_info() is not None else EvalchemyExecutionMode.LOCAL
+    if execution is EvalchemyExecutionMode.LOCAL:
+        with local_inference(inference.model, inference.engine) as session:
+            outcome = run_local_evalchemy(
+                session.model,
+                config.run,
+                output_dir,
+                env_vars=runtime_env,
+            )
+            jobs = {"serve": "local", **outcome.jobs}
+    else:
+        with remote_inference(inference) as session:
+            outcome = run_evalchemy(
+                session.model,
+                config.run,
+                output_dir,
+                env_vars=runtime_env,
+            )
+            jobs = {f"serve-{index}" if index else "serve": str(job.job_id) for index, job in enumerate(session.jobs)}
+            jobs |= outcome.jobs
     return ServedEvalchemyRun(out_path=output_dir, jobs=jobs)
 
 
@@ -132,6 +158,7 @@ class EvalGroup:
     )
     tokenizer: str | None = None
     discover_latest_checkpoint: bool = True
+    execution: EvalchemyExecutionMode = EvalchemyExecutionMode.AUTO
 
 
 def evaluate_evalchemy(
@@ -144,6 +171,7 @@ def evaluate_evalchemy(
     *,
     tokenizer: str | None = None,
     discover_latest_checkpoint: bool = True,
+    execution: EvalchemyExecutionMode = EvalchemyExecutionMode.AUTO,
     version: str | None = None,
 ) -> ArtifactStep[EvalchemyResult]:
     """Build one typed Evalchemy result artifact."""
@@ -162,19 +190,24 @@ def evaluate_evalchemy(
             ),
             accelerator=accelerator,
             run=config,
+            execution=execution,
             out_path=ctx.output_path,
             discover_latest_checkpoint=discover_latest_checkpoint,
+        )
+
+    run_step = run_served_evalchemy
+    if execution is not EvalchemyExecutionMode.LOCAL:
+        run_step = remote(
+            run_served_evalchemy,
+            resources=_orchestrator_resources(accelerator),
+            env_vars=env_vars_from_keys(EVAL_ENV_KEYS),
         )
 
     return ArtifactStep(
         name=name,
         version=resolve_version(name, version),
         artifact_type=EvalchemyResult,
-        run=remote(
-            run_served_evalchemy,
-            resources=_orchestrator_resources(accelerator),
-            env_vars=env_vars_from_keys(EVAL_ENV_KEYS),
-        ),
+        run=run_step,
         build_config=build_config,
         deps=deps,
     )
@@ -195,6 +228,7 @@ def eval_step(
         accelerator=group.accelerator,
         tokenizer=group.tokenizer,
         discover_latest_checkpoint=group.discover_latest_checkpoint,
+        execution=group.execution,
         version=version,
     )
     return cast("ArtifactStep[EvalResult]", step)

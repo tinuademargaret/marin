@@ -21,23 +21,26 @@ Marin supports three evaluation paths:
 
 ## Post-hoc evaluation (evalchemy over a served endpoint)
 
-A post-hoc eval is decoupled from the model backend by an OpenAI-compatible URL. Each `EvalGroup` is
-run inside one `remote_inference` context. The generic group runner passes its `RunningModel` to
-`run_evalchemy`, then inference is torn down.
+A post-hoc eval is decoupled from the model backend by an OpenAI-compatible URL. `EvalGroup` uses
+`EvalchemyExecutionMode.AUTO` by default: it starts inference and the Evalchemy client on the current
+host outside Iris, and submits them through Iris from an Iris job. `LOCAL` and `IRIS` select either
+mode explicitly. The group runner tears inference down after Evalchemy finishes.
 Multiple-choice tasks use the served backend's logprob API, so they run the same way as generation —
 no separate JAX-logprob backend.
 
 The lifecycle and the evaluator are separate APIs:
 
 ```python
-with remote_inference(model, engine, iris) as session:
+with local_inference(inference.model, inference.engine) as session:
+    run_local_evalchemy(session.model, eval_config, output_path, env_vars=env)
+
+with remote_inference(inference) as session:
     run_evalchemy(session.model, eval_config, output_path, env_vars=env)
 ```
 
-`remote_inference` owns startup, liveness, Iris link registration, and teardown. Endpoint-oriented
-mechanisms such as `run_evalchemy`, `run_lm_eval`, and `run_harbor` own only their native task and
-result contracts. This keeps the lifecycle common without hiding mechanism-specific configuration
-or outcomes behind a universal `do_eval` interface.
+`local_inference` owns the current-host server lifecycle. `remote_inference` also owns Iris link
+registration. Endpoint-oriented mechanisms such as `run_local_evalchemy`, `run_evalchemy`,
+`run_lm_eval`, and `run_harbor` own their native task and result contracts.
 
 - [`eval_step`][marin.experiment.evaluation.eval_step] builds one post-hoc eval artifact from an
   `EvalGroup`; combine groups and aggregate them with

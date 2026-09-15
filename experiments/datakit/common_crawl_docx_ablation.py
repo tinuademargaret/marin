@@ -28,6 +28,7 @@ from levanter.optim.config import AdamConfig
 from marin.evaluation.evalchemy.runner import EvalchemyRunConfig
 from marin.evaluation.evaluation_config import EvalTaskConfig
 from marin.evaluation.hardware import AcceleratorChoice, Platform
+from marin.evaluation.model_config import ServeBackend, ServeConfig
 from marin.execution.lazy import ArtifactStep
 from marin.experiment.cli import build_options
 from marin.experiment.evaluation import EvalGroup, EvalReport, eval_report, eval_steps
@@ -83,6 +84,7 @@ def build(
         gpu_count=gpu_count,
         region=region,
     )
+    evaluation_serve = ServeConfig(backend=ServeBackend.LEVANTER)
     reports: dict[str, ArtifactStep[EvalReport]] = {}
     datasets = docx_extraction_datasets(variants, region=region)
     for variant in variants:
@@ -113,10 +115,11 @@ def build(
         )
         selected_benchmarks = EvalGroup(
             config=EvalchemyRunConfig(name="docx-selected", tasks=ABLATION_BENCHMARK_TASKS),
+            serve=evaluation_serve,
             accelerator=evaluation_accelerator,
         )
         evaluation_groups = tuple(
-            replace(group, tokenizer=marin_tokenizer)
+            replace(group, serve=evaluation_serve, tokenizer=marin_tokenizer)
             for group in (
                 selected_benchmarks,
                 *wikitablequestions_eval(

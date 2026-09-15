@@ -12,11 +12,16 @@ serving, the eval itself) is exercised by the cluster smoke.
 
 import json
 import os
+import subprocess
 
-from marin.evaluation.evalchemy.client import build_command, build_model_args, scored_results
+import pytest
+from marin.evaluation.evalchemy.client import CONFIG_ENV_KEY, build_command, build_model_args, scored_results
 from marin.evaluation.evalchemy.runner import (
     EvalchemyRunConfig,
+    EvalPipelineError,
+    PipelineStage,
     _run_config_json,
+    run_local_evalchemy,
 )
 from marin.evaluation.evaluation_config import EvalTaskConfig
 from marin.evaluation.hardware import AcceleratorChoice, Platform
@@ -26,6 +31,7 @@ from marin.execution.lazy import ArtifactStep
 from marin.experiment.evaluation import evaluate_evalchemy
 from marin.inference.types import OpenAIEndpoint, RunningModel
 from marin.training.training import LevanterCheckpoint
+from rigging.filesystem import StoragePath
 
 from experiments.evals.evals import wikitablequestions_eval
 
@@ -116,6 +122,46 @@ def test_task_dirs_distinguish_shot_variants_of_one_task():
 
     assert [t["name"] for t in tasks] == ["hellaswag", "hellaswag"]
     assert [t["dir"] for t in tasks] == ["hellaswag_0shot", "hellaswag_10shot"]
+
+
+def test_local_evalchemy_runs_client_and_returns_durable_result(monkeypatch):
+    output_dir = "memory://evalchemy-tests/local-success"
+
+    def run_client(command, *, check, env):
+        del command
+        assert check is True
+        payload = json.loads(env[CONFIG_ENV_KEY])
+        result_path = str(
+            StoragePath(payload["out_path"]) / payload["tasks"][0]["dir"] / "local-completions" / "results_test.json"
+        )
+        StoragePath(result_path).write_text(json.dumps({"results": {"arc_easy": {"acc,none": 0.5}}}))
+        return subprocess.CompletedProcess((), 0)
+
+    monkeypatch.setattr(subprocess, "run", run_client)
+
+    outcome = run_local_evalchemy(_MODEL, _config(tasks=(EvalTaskConfig("arc_easy", 0),)), output_dir, env_vars={})
+
+    assert outcome.jobs == {"eval": "local"}
+    assert outcome.result.path == output_dir
+
+
+def test_local_evalchemy_classifies_client_failure(monkeypatch):
+    def fail_client(command, *, check, env):
+        del check, env
+        raise subprocess.CalledProcessError(17, command)
+
+    monkeypatch.setattr(subprocess, "run", fail_client)
+
+    with pytest.raises(EvalPipelineError) as exc_info:
+        run_local_evalchemy(
+            _MODEL,
+            _config(tasks=(EvalTaskConfig("arc_easy", 0),)),
+            "memory://evalchemy-tests/local-failure",
+            env_vars={},
+        )
+
+    assert exc_info.value.stage is PipelineStage.EVAL
+    assert exc_info.value.jobs == {"eval": "local"}
 
 
 def test_wikitablequestions_eval_uses_generation_with_a_short_answer_budget():
