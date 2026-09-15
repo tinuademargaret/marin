@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import click
+import jax
 import pytest
 import requests
 from click.testing import CliRunner
@@ -46,6 +47,7 @@ from marin.inference.iris_cli import (
 )
 from marin.inference.levanter_backend import (
     DEFAULT_LEVANTER_MAX_SEQ_LEN,
+    LevanterBackend,
     inference_mesh,
     levanter_max_seq_len,
     validate_levanter_dtype,
@@ -235,6 +237,43 @@ def test_validate_levanter_dtype_rejects_vllm_aliases():
     for alias in ("auto", "half", "float"):
         with pytest.raises(ValueError, match="not supported by the levanter backend"):
             validate_levanter_dtype(alias)
+
+
+def test_levanter_backend_makes_remote_compilation_cache_safe_for_xla(monkeypatch):
+    class ModelResolutionReached(RuntimeError):
+        pass
+
+    def stop_before_model_io(_checkpoint_ref):
+        raise ModelResolutionReached
+
+    original_cache_dir = jax.config.jax_compilation_cache_dir
+    original_xla_caches = jax.config.jax_persistent_cache_enable_xla_caches
+    jax.config.update("jax_compilation_cache_dir", None)
+    jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+    monkeypatch.delenv("JAX_COMPILATION_CACHE_DIR", raising=False)
+    monkeypatch.delenv("JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES", raising=False)
+    monkeypatch.setattr("iris.runtime.jax_init.marin_prefix", lambda: "gs://test-bucket")
+    monkeypatch.setattr("marin.inference.levanter_backend.HFCheckpointConverter.from_hf", stop_before_model_io)
+
+    spec = ModelSpec(
+        weights="gs://test-bucket/model",
+        api_model="test-model",
+        num_chips=1,
+        tensor_parallel_size=1,
+        dtype="bfloat16",
+        max_model_len=1024,
+        chat_template_content=None,
+    )
+    try:
+        with pytest.raises(ModelResolutionReached):
+            with LevanterBackend(LevanterEngineConfig()).load_model(spec):
+                pass
+
+        assert jax.config.jax_compilation_cache_dir == "gs://test-bucket/compilation-cache"
+        assert jax.config.jax_persistent_cache_enable_xla_caches == "none"
+    finally:
+        jax.config.update("jax_compilation_cache_dir", original_cache_dir)
+        jax.config.update("jax_persistent_cache_enable_xla_caches", original_xla_caches)
 
 
 @pytest.mark.parametrize(

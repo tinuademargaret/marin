@@ -13,6 +13,7 @@ from typing import Any, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import jmp
+from iris.runtime.jax_init import configure_jax_compilation_cache
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, load_tokenizer
 from levanter.inference.engine import InferenceEngineConfig
 from levanter.inference.openai import InferenceServer, InferenceServerConfig
@@ -28,7 +29,6 @@ from marin.inference.model_preparation import read_attention_heads, select_tenso
 from marin.inference.vllm_server import (
     JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECONDS,
     JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES,
-    default_jax_compilation_cache_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,7 @@ class LevanterBackend:
 
         # Levanter compiles on the first request; write to the cache the vLLM path already uses so
         # a re-serve of the same model on the same slice skips the compile.
-        jax.config.update("jax_compilation_cache_dir", default_jax_compilation_cache_dir())
+        configure_jax_compilation_cache()
         jax.config.update("jax_persistent_cache_min_entry_size_bytes", JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES)
         jax.config.update("jax_persistent_cache_min_compile_time_secs", JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECONDS)
 

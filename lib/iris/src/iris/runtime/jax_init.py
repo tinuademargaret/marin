@@ -95,13 +95,12 @@ def configure_jax_compilation_cache() -> None:
     """
     import jax  # noqa: PLC0415  # optional dep: jax (iris does not depend on jax)
 
-    if os.environ.get("JAX_COMPILATION_CACHE_DIR") or jax.config.jax_compilation_cache_dir:
-        return
-
-    cache_dir = f"{marin_prefix().rstrip('/')}/{_COMPILATION_CACHE_SUBDIR}"
-    os.environ["JAX_COMPILATION_CACHE_DIR"] = cache_dir
-    jax.config.update("jax_compilation_cache_dir", cache_dir)
-    logger.info("JAX compilation cache: %s", cache_dir)
+    cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR") or jax.config.jax_compilation_cache_dir
+    if not cache_dir:
+        cache_dir = f"{marin_prefix().rstrip('/')}/{_COMPILATION_CACHE_SUBDIR}"
+        os.environ["JAX_COMPILATION_CACHE_DIR"] = cache_dir
+        jax.config.update("jax_compilation_cache_dir", cache_dir)
+        logger.info("JAX compilation cache: %s", cache_dir)
 
     if "://" in cache_dir and "JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES" not in os.environ:
         jax.config.update("jax_persistent_cache_enable_xla_caches", "none")

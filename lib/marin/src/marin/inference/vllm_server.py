@@ -18,7 +18,6 @@ from typing import Protocol
 from urllib.parse import urlparse
 
 import requests
-from rigging.filesystem import marin_prefix
 from rigging.timing import Deadline, ExponentialBackoff, retry_with_backoff
 
 from marin.inference.config import WORKER_PYTHON_VERSION, InferenceModelConfig, VllmCompilationCacheMode
@@ -672,11 +671,6 @@ class VllmEnvironment:
 # Levanter's in-process JAX cache remains separate from vLLM's managed local archive.
 JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES = -1
 JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECONDS = 2
-
-
-def default_jax_compilation_cache_dir() -> str:
-    """Persistent XLA/JAX compilation cache used by Levanter serving on this slice."""
-    return f"{marin_prefix()}/compilation-cache"
 
 
 # Canonical vLLM environment defaults for the native subprocess.

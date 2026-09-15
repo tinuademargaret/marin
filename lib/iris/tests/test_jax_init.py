@@ -394,7 +394,9 @@ def test_configure_compilation_cache_derives_from_marin_prefix() -> None:
 
 @pytest.mark.parametrize("source", ["env", "jax_config"])
 def test_configure_compilation_cache_keeps_explicit_dir(source: str) -> None:
-    """An explicit cache dir (env var or jax.config) is preserved; the prefix default is not derived."""
+    """An explicit remote cache dir is preserved and made safe for XLA."""
+    from jax._src import compiler as jax_compiler  # noqa: PLC0415
+
     with _isolated_jax_cache_config():
         if source == "env":
             os.environ["JAX_COMPILATION_CACHE_DIR"] = "gs://explicit/cache"
@@ -410,6 +412,8 @@ def test_configure_compilation_cache_keeps_explicit_dir(source: str) -> None:
         else:
             assert jax.config.jax_compilation_cache_dir == "gs://explicit/cache"
             assert "JAX_COMPILATION_CACHE_DIR" not in os.environ
+        options = jax_compiler.get_compile_options(num_replicas=1, num_partitions=1)
+        assert options.executable_build_options.debug_options.xla_gpu_per_fusion_autotune_cache_dir == ""
 
 
 @pytest.mark.parametrize("scheme", ["gs://", "s3://"])
