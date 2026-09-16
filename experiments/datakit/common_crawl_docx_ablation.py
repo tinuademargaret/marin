@@ -18,6 +18,9 @@ Every treatment uses the same model, optimizer, token budget, evaluation cadence
 and accelerator shape. Normalization still filters and deduplicates each treatment
 independently; intersect ``source_id`` values first when the experiment must compare
 representations over exactly the same documents rather than end-to-end pipeline yield.
+
+Pass ``--no-benchmarks`` to skip LM Harness and post-training Evalchemy benchmarks.
+Training loss and Paloma validation losses are still logged to W&B.
 """
 
 from dataclasses import replace
@@ -33,12 +36,14 @@ from marin.execution.lazy import ArtifactStep
 from marin.experiment.cli import build_options
 from marin.experiment.evaluation import EvalGroup, EvalReport, eval_report, eval_steps
 from marin.experiment.train import EvalSuite, train_lm
+from marin.training.training import LevanterCheckpoint
 
 from experiments.datasets.docx_extraction_ablation import (
     NormalizedVariant,
     docx_extraction_datasets,
     normalized_variants,
 )
+from experiments.datasets.paloma import paloma_datasets
 from experiments.evals.evals import wikitablequestions_eval
 from experiments.llama import llama_30m, llama_150m
 from experiments.marin_tokenizer import marin_tokenizer
@@ -64,10 +69,11 @@ def build(
     benchmark_every: int,
     benchmark_max_examples: int,
     wikitablequestions_max_examples: int,
+    benchmarks: bool,
     wandb_entity: str,
     wandb_project: str,
     wandb_group: str,
-) -> dict[str, ArtifactStep[EvalReport]]:
+) -> dict[str, ArtifactStep[EvalReport] | ArtifactStep[LevanterCheckpoint]]:
     """Build matched tokenization, training, and post-training evaluation graphs."""
     model = MODELS[model_size]
     training_resources = ResourceConfig.with_gpu(
@@ -85,8 +91,9 @@ def build(
         region=region,
     )
     evaluation_serve = ServeConfig(backend=ServeBackend.LEVANTER)
-    reports: dict[str, ArtifactStep[EvalReport]] = {}
+    outputs: dict[str, ArtifactStep[EvalReport] | ArtifactStep[LevanterCheckpoint]] = {}
     datasets = docx_extraction_datasets(variants, region=region)
+    validation = tuple(paloma_datasets(tokenizer=marin_tokenizer).values())
     for variant in variants:
         dataset = datasets[variant.name]
         checkpoint = train_lm(
@@ -99,12 +106,17 @@ def build(
             seq_len=model.max_seq_len,
             num_train_steps=train_steps,
             z_loss_weight=None,
-            evals=EvalSuite(
-                ABLATION_BENCHMARK_TASKS,
-                every=benchmark_every,
-                max_examples=benchmark_max_examples,
-                run_initial=True,
+            evals=(
+                EvalSuite(
+                    ABLATION_BENCHMARK_TASKS,
+                    every=benchmark_every,
+                    max_examples=benchmark_max_examples,
+                    run_initial=True,
+                )
+                if benchmarks
+                else None
             ),
+            validation=validation,
             steps_per_eval=evaluation_every,
             resources=training_resources,
             wandb_entity=wandb_entity,
@@ -113,6 +125,10 @@ def build(
             wandb_mode="online",
             tags=("docx", "extraction-ablation", variant.name, model_size),
         )
+        if not benchmarks:
+            outputs[variant.name] = checkpoint
+            continue
+
         selected_benchmarks = EvalGroup(
             config=EvalchemyRunConfig(name="docx-selected", tasks=ABLATION_BENCHMARK_TASKS),
             serve=evaluation_serve,
@@ -129,11 +145,11 @@ def build(
             )
         )
         results = eval_steps(checkpoint, evaluation_groups)
-        reports[variant.name] = eval_report(
+        outputs[variant.name] = eval_report(
             results,
             name=f"docx-extraction-ablation/{model_size}/{variant.name}",
         )
-    return reports
+    return outputs
 
 
 @click.command(help=__doc__)
@@ -155,6 +171,12 @@ def build(
 @click.option("--benchmark-every", type=click.IntRange(min=1), required=True)
 @click.option("--benchmark-max-examples", type=click.IntRange(min=1), default=1000, show_default=True)
 @click.option("--wikitablequestions-max-examples", type=click.IntRange(min=1), default=1000, show_default=True)
+@click.option(
+    "--benchmarks/--no-benchmarks",
+    default=True,
+    show_default=True,
+    help="Run periodic LM Harness and post-training Evalchemy benchmarks.",
+)
 @click.option("--wandb-entity", required=True, help="W&B user or team that owns the project.")
 @click.option("--wandb-project", required=True, help="W&B project receiving all treatment runs.")
 @click.option("--wandb-group", required=True, help="Shared W&B group for this extraction comparison.")
@@ -171,10 +193,11 @@ def main(
     benchmark_every: int,
     benchmark_max_examples: int,
     wikitablequestions_max_examples: int,
+    benchmarks: bool,
     wandb_entity: str,
     wandb_project: str,
     wandb_group: str,
-) -> dict[str, ArtifactStep[EvalReport]]:
+) -> dict[str, ArtifactStep[EvalReport] | ArtifactStep[LevanterCheckpoint]]:
     return build(
         variants=normalized_variants(normalized_paths),
         model_size=model_size,
@@ -187,6 +210,7 @@ def main(
         benchmark_every=benchmark_every,
         benchmark_max_examples=benchmark_max_examples,
         wikitablequestions_max_examples=wikitablequestions_max_examples,
+        benchmarks=benchmarks,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
         wandb_group=wandb_group,
