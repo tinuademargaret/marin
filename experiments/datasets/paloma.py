@@ -40,20 +40,30 @@ _PALOMA_SUBSETS = {
 }
 
 
-def paloma_dataset(subset: str, *, tokenizer: str = llama3_tokenizer) -> ArtifactStep[TokenizedCache]:
+def paloma_dataset(
+    subset: str,
+    *,
+    tokenizer: str = llama3_tokenizer,
+    raw_prefix: str | None = None,
+) -> ArtifactStep[TokenizedCache]:
     """One Paloma subset as a validation handle."""
+    raw_path = _PALOMA_RAW if raw_prefix is None else f"{raw_prefix.rstrip('/')}/{_PALOMA_RAW}"
     return tokenized(
         f"paloma/{subset}-llama3",
         tokenizer=tokenizer,
         version="2026.06.28",
-        paths=[f"{_PALOMA_RAW}/{_PALOMA_SUBSETS[subset]}/val/val*.jsonl.gz"],
+        paths=[f"{raw_path}/{_PALOMA_SUBSETS[subset]}/val/val*.jsonl.gz"],
         validation=True,
     )
 
 
-def paloma_datasets(*, tokenizer: str = llama3_tokenizer) -> dict[str, ArtifactStep[TokenizedCache]]:
+def paloma_datasets(
+    *,
+    tokenizer: str = llama3_tokenizer,
+    raw_prefix: str | None = None,
+) -> dict[str, ArtifactStep[TokenizedCache]]:
     """All Paloma subsets, keyed by subset name."""
-    return {subset: paloma_dataset(subset, tokenizer=tokenizer) for subset in _PALOMA_SUBSETS}
+    return {subset: paloma_dataset(subset, tokenizer=tokenizer, raw_prefix=raw_prefix) for subset in _PALOMA_SUBSETS}
 
 
 if __name__ == "__main__":

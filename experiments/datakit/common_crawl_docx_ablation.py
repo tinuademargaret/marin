@@ -20,7 +20,8 @@ independently; intersect ``source_id`` values first when the experiment must com
 representations over exactly the same documents rather than end-to-end pipeline yield.
 
 Pass ``--no-benchmarks`` to skip LM Harness and post-training Evalchemy benchmarks.
-Training loss and Paloma validation losses are still logged to W&B.
+Paloma validation is opt-in because its canonical shards may not be readable from
+every compute environment.
 """
 
 from dataclasses import replace
@@ -70,6 +71,8 @@ def build(
     benchmark_max_examples: int,
     wikitablequestions_max_examples: int,
     benchmarks: bool,
+    paloma_validation: bool,
+    paloma_raw_prefix: str,
     wandb_entity: str,
     wandb_project: str,
     wandb_group: str,
@@ -93,7 +96,11 @@ def build(
     evaluation_serve = ServeConfig(backend=ServeBackend.LEVANTER)
     outputs: dict[str, ArtifactStep[EvalReport] | ArtifactStep[LevanterCheckpoint]] = {}
     datasets = docx_extraction_datasets(variants, region=region)
-    validation = tuple(paloma_datasets(tokenizer=marin_tokenizer).values())
+    validation = (
+        tuple(paloma_datasets(tokenizer=marin_tokenizer, raw_prefix=paloma_raw_prefix).values())
+        if paloma_validation
+        else ()
+    )
     if benchmarks and benchmark_every is None:
         raise ValueError("benchmark_every is required when benchmarks are enabled")
     for variant in variants:
@@ -183,6 +190,18 @@ def build(
     show_default=True,
     help="Run periodic LM Harness and post-training Evalchemy benchmarks.",
 )
+@click.option(
+    "--paloma-validation/--no-paloma-validation",
+    default=False,
+    show_default=True,
+    help="Include Paloma validation loss (requires access to the Paloma raw bucket).",
+)
+@click.option(
+    "--paloma-raw-prefix",
+    default="gs://marin-us-central2",
+    show_default=True,
+    help="Bucket prefix containing the canonical pinned Paloma raw shards.",
+)
 @click.option("--wandb-entity", required=True, help="W&B user or team that owns the project.")
 @click.option("--wandb-project", required=True, help="W&B project receiving all treatment runs.")
 @click.option("--wandb-group", required=True, help="Shared W&B group for this extraction comparison.")
@@ -200,6 +219,8 @@ def main(
     benchmark_max_examples: int,
     wikitablequestions_max_examples: int,
     benchmarks: bool,
+    paloma_validation: bool,
+    paloma_raw_prefix: str,
     wandb_entity: str,
     wandb_project: str,
     wandb_group: str,
@@ -219,6 +240,8 @@ def main(
         benchmark_max_examples=benchmark_max_examples,
         wikitablequestions_max_examples=wikitablequestions_max_examples,
         benchmarks=benchmarks,
+        paloma_validation=paloma_validation,
+        paloma_raw_prefix=paloma_raw_prefix,
         wandb_entity=wandb_entity,
         wandb_project=wandb_project,
         wandb_group=wandb_group,
