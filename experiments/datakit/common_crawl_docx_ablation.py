@@ -66,7 +66,7 @@ def build(
     batch_size: int,
     train_steps: int,
     evaluation_every: int,
-    benchmark_every: int,
+    benchmark_every: int | None,
     benchmark_max_examples: int,
     wikitablequestions_max_examples: int,
     benchmarks: bool,
@@ -94,6 +94,8 @@ def build(
     outputs: dict[str, ArtifactStep[EvalReport] | ArtifactStep[LevanterCheckpoint]] = {}
     datasets = docx_extraction_datasets(variants, region=region)
     validation = tuple(paloma_datasets(tokenizer=marin_tokenizer).values())
+    if benchmarks and benchmark_every is None:
+        raise ValueError("benchmark_every is required when benchmarks are enabled")
     for variant in variants:
         dataset = datasets[variant.name]
         checkpoint = train_lm(
@@ -168,7 +170,11 @@ def build(
 @click.option("--batch-size", type=click.IntRange(min=1), required=True)
 @click.option("--train-steps", type=click.IntRange(min=1), required=True)
 @click.option("--evaluation-every", type=click.IntRange(min=1), required=True)
-@click.option("--benchmark-every", type=click.IntRange(min=1), required=True)
+@click.option(
+    "--benchmark-every",
+    type=click.IntRange(min=1),
+    help="LM Harness interval. Required with --benchmarks; ignored with --no-benchmarks.",
+)
 @click.option("--benchmark-max-examples", type=click.IntRange(min=1), default=1000, show_default=True)
 @click.option("--wikitablequestions-max-examples", type=click.IntRange(min=1), default=1000, show_default=True)
 @click.option(
@@ -190,7 +196,7 @@ def main(
     batch_size: int,
     train_steps: int,
     evaluation_every: int,
-    benchmark_every: int,
+    benchmark_every: int | None,
     benchmark_max_examples: int,
     wikitablequestions_max_examples: int,
     benchmarks: bool,
@@ -198,6 +204,8 @@ def main(
     wandb_project: str,
     wandb_group: str,
 ) -> dict[str, ArtifactStep[EvalReport] | ArtifactStep[LevanterCheckpoint]]:
+    if benchmarks and benchmark_every is None:
+        raise click.UsageError("--benchmark-every is required when benchmarks are enabled")
     return build(
         variants=normalized_variants(normalized_paths),
         model_size=model_size,
